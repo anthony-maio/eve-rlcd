@@ -13,6 +13,9 @@
 ## Global Constraints
 
 - Base model is `anthonym21/Eve-2-MoE-IT-272M`. Its code is vendored under `rlcd/eve/` (MIT, the author's own). Never load it with `trust_remote_code`; always use the vendored class so the policy adapter can walk `model.transformer.h`.
+- Every Eve config is built or loaded through `rlcd.compat.eve_config(**kw)` or `rlcd.compat.load_eve_config(path_or_id)`. Never call `eve_config(...)` or `EveConfig.from_pretrained` directly, and never call `EveMoEForCausalLM.from_pretrained` without `config=load_eve_config(...)`. Reason: EveConfig's MoE routing field `top_k` collides with a legacy generation default in transformers 4.x, which silently overwrites it with 50.
+- The HF wrapper does not inherit `GenerationMixin` on transformers >= 4.50, so `model.generate()` is unavailable. Nothing in this project needs it; use an explicit greedy loop where text generation is wanted for a sanity check.
+- The ASCII rule exempts the vendored files under `rlcd/eve/`, which stay byte-identical to the hub.
 - Prompt format is exactly the one in the spec, ending in `Assistant: The answer is`. The decision token is the next token, one of `" A"` .. `" Z"`.
 - Cardinality is 2 to 26 inclusive. `noul` questions have choices exactly `["true", "false"]`. `score` questions must have `ordered: true`.
 - Batching uses right padding with pad id 50256. Logits are gathered at each row's last real token. Never left-pad (Eve ignores attention masks and has no position ids).
@@ -68,10 +71,11 @@ eve-rlcd/
 - Create: `pyproject.toml`
 - Create: `rlcd/__init__.py`, `rlcd/eve/__init__.py`
 - Create: `rlcd/eve/configuration_eve.py`, `rlcd/eve/modeling_eve.py` (downloaded)
+- Create: `rlcd/compat.py` (`eve_config(**kw)`, `load_eve_config(path_or_id)`; added during execution after the `top_k` collision was found)
 - Create: `tests/test_scaffold.py`
 
 **Interfaces:**
-- Produces: importable package `rlcd`, vendored `rlcd.eve.configuration_eve.EveConfig` and `rlcd.eve.modeling_eve.EveMoEForCausalLM`.
+- Produces: `rlcd.compat.eve_config`, `rlcd.compat.load_eve_config`, importable package `rlcd`, vendored `rlcd.eve.configuration_eve.EveConfig` and `rlcd.eve.modeling_eve.EveMoEForCausalLM`.
 
 - [ ] **Step 1: Write pyproject.toml**
 
@@ -145,12 +149,12 @@ curl.exe -sL https://huggingface.co/anthonym21/Eve-2-MoE-IT-272M/raw/main/modeli
 ```python
 import torch
 
-from rlcd.eve.configuration_eve import EveConfig
+from rlcd.compat import eve_config
 from rlcd.eve.modeling_eve import EveMoEForCausalLM
 
 
-def tiny_config() -> EveConfig:
-    return EveConfig(
+def tiny_config():
+    return eve_config(
         vocab_size=50304, n_layer=2, n_embd=32, n_head=2, head_dim=16,
         block_size=128, num_experts=2, top_k=1,
         expert_intermediate_size=64, shared_expert_intermediate_size=64,
@@ -429,7 +433,7 @@ git commit -m "Add question schema and prompt rendering"
 ```python
 import torch
 
-from rlcd.eve.configuration_eve import EveConfig
+from rlcd.compat import eve_config
 from rlcd.eve.modeling_eve import EveMoEForCausalLM
 from rlcd.policy import PAD_ID, decision_logits, encode_batch
 from rlcd.schema import NEG
@@ -443,7 +447,7 @@ class FakeTok:
 
 def tiny_model() -> EveMoEForCausalLM:
     torch.manual_seed(0)
-    cfg = EveConfig(vocab_size=50304, n_layer=2, n_embd=32, n_head=2, head_dim=16,
+    cfg = eve_config(vocab_size=50304, n_layer=2, n_embd=32, n_head=2, head_dim=16,
                     block_size=128, num_experts=2, top_k=1,
                     expert_intermediate_size=64, shared_expert_intermediate_size=64)
     return EveMoEForCausalLM(cfg).eval()
@@ -509,6 +513,7 @@ from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 from transformers import AutoTokenizer
 
+from rlcd.compat import load_eve_config
 from rlcd.eve.modeling_eve import EveMoEForCausalLM
 from rlcd.schema import MAX_CHOICES, NEG, Question, render_prompt
 
@@ -538,7 +543,10 @@ def _repair_tie(model: EveMoEForCausalLM, path_or_id: str) -> None:
 
 def load_eve(path_or_id: str = EVE_ID, device: str = "cuda"):
     tokenizer = AutoTokenizer.from_pretrained(path_or_id)
-    model = EveMoEForCausalLM.from_pretrained(path_or_id, torch_dtype=torch.float32)
+    model = EveMoEForCausalLM.from_pretrained(path_or_id, config=load_eve_config(path_or_id),
+                                              torch_dtype=torch.float32)
+    if model.config.top_k != model.transformer.h[0].mlp.top_k:
+        raise RuntimeError("MoE routing top_k mismatch between config and built model")
     _repair_tie(model, path_or_id)
     model.to(device)
     return model, tokenizer
@@ -603,10 +611,14 @@ model.eval()
 letters = letter_token_ids(tok)
 
 # 1. Plain generation still works (proves weights loaded sensibly).
+# The HF wrapper has no GenerationMixin on current transformers, so decode greedily by hand.
 ids = tok.encode("User: What is the capital of France?\nAssistant:", return_tensors="pt").cuda()
-with torch.no_grad():
-    out = model.generate(ids, max_new_tokens=20, do_sample=False)
-print("GEN:", repr(tok.decode(out[0][ids.shape[1]:])))
+start = ids.shape[1]
+with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+    for _ in range(20):
+        nxt = model(input_ids=ids).logits[:, -1, :].argmax(-1, keepdim=True)
+        ids = torch.cat([ids, nxt], dim=1)
+print("GEN:", repr(tok.decode(ids[0][start:])))
 
 # 2. Zero-shot decisions on three obvious questions.
 qs = [
@@ -1640,7 +1652,7 @@ import copy
 import torch
 
 from rlcd.env import BanditEnv
-from rlcd.eve.configuration_eve import EveConfig
+from rlcd.compat import eve_config
 from rlcd.eve.modeling_eve import EveMoEForCausalLM
 from rlcd.schema import Question
 from rlcd.train_rl import rl_step
@@ -1653,7 +1665,7 @@ class FakeTok:
 
 def tiny():
     torch.manual_seed(0)
-    cfg = EveConfig(vocab_size=50304, n_layer=2, n_embd=32, n_head=2, head_dim=16, block_size=256,
+    cfg = eve_config(vocab_size=50304, n_layer=2, n_embd=32, n_head=2, head_dim=16, block_size=256,
                     num_experts=2, top_k=1, expert_intermediate_size=64, shared_expert_intermediate_size=64)
     return EveMoEForCausalLM(cfg)
 
@@ -2191,7 +2203,7 @@ git commit -m "Add evaluation, comparison plots, and temperature fitting"
 import torch
 
 from rlcd.amputate import amputate, build_decision_head
-from rlcd.eve.configuration_eve import EveConfig
+from rlcd.compat import eve_config
 from rlcd.eve.modeling_eve import EveMoEForCausalLM
 from rlcd.infer import DecisionModel
 from rlcd.schema import Question
@@ -2207,7 +2219,7 @@ class FakeTok:
 
 def tiny():
     torch.manual_seed(0)
-    cfg = EveConfig(vocab_size=50304, n_layer=2, n_embd=32, n_head=2, head_dim=16, block_size=256,
+    cfg = eve_config(vocab_size=50304, n_layer=2, n_embd=32, n_head=2, head_dim=16, block_size=256,
                     num_experts=2, top_k=1, expert_intermediate_size=64, shared_expert_intermediate_size=64)
     return EveMoEForCausalLM(cfg).eval()
 
@@ -2321,7 +2333,7 @@ import torch
 from safetensors.torch import load_file
 from transformers import AutoTokenizer
 
-from rlcd.eve.configuration_eve import EveConfig
+from rlcd.compat import load_eve_config
 from rlcd.eve.modeling_eve import EveMoEForCausalLM
 from rlcd.metrics import entropy_confidence
 from rlcd.policy import encode_batch, eve_hidden
@@ -2335,7 +2347,7 @@ class DecisionModel:
     @classmethod
     def load(cls, path, device: str = "cuda", tokenizer=None, max_len: int = 512) -> "DecisionModel":
         path = Path(path)
-        config = EveConfig.from_pretrained(path)
+        config = load_eve_config(str(path))
         config.tie_word_embeddings = False
         model = EveMoEForCausalLM(config)
         model.load_state_dict(load_file(str(path / "transformer.safetensors")), strict=False)
@@ -2444,6 +2456,28 @@ Copy-Item runs\compare\coverage.png docs\img\coverage.png
 git add README.md docs/img
 git commit -m "Add README with results and reproduction steps"
 ```
+
+---
+
+### Task 12: Model card (only if results hold up)
+
+**Gate:** Do this task only if `runs/compare/table.md` shows the RLCD arm with lower ECE than the RLVR arm at comparable accuracy (within 3 points). If the hypothesis failed, skip to Task 13 and write the article about the negative result instead; do not publish a model.
+
+**Files:**
+- Create: `MODEL_CARD.md` (becomes `README.md` of the Hugging Face model repo)
+
+- [ ] **Step 1: Write MODEL_CARD.md** using the writing-in-anthonys-voice skill. YAML front matter: `license: mit`, `base_model: anthonym21/Eve-2-MoE-IT-272M`, `tags: [moe, eve-moe, calibration, rlcd, decision-model, classification, custom_code]`, `language: [en]`, `datasets` listing the seven public sources. Sections in order: what the model is (a decision-only model, 26-row head, cannot emit text); the three primitives with one `DecisionModel` code example each; how it was trained (bandit feedback, reward `c - p_a`, warmup SFT, KL to reference, hyperparameters copied from `runs/rlcd/meta.json`); results table and both plots; the RLVR versus RLCD comparison stated plainly; limitations (272M, cardinality 26, synthetic triage labels, calibration only measured in-distribution, thresholds are coupled to this checkpoint); how to reproduce (link to the GitHub repo); credits; citation block. Every number must be copied from `runs/compare/metrics.json` or `runs/*/temperature.json`, never typed from memory.
+- [ ] **Step 2: ASCII check** on the file, then commit with message `Add model card`.
+- [ ] **Step 3: Do not upload.** Publishing to the Hugging Face hub is Anthony's call; leave the upload command in the final report.
+
+### Task 13: Article, about 1500 words
+
+**Files:**
+- Create: `docs/article/2026-09-rlcd-toy.md`
+
+- [ ] **Step 1: Draft** with the writing-in-anthonys-voice skill, Substack register (not the fast-typing X register). Target 1400 to 1600 words. It is a follow-up to "Jev: The Language Model That Won't Talk". Required beats: the previous post ended on "whether RLCD delivers is unproven"; TypeSafe published nothing, so here is a from-scratch guess at what RLCD could be; the bandit framing and why it makes this RL and not supervised learning; the reward `c - p_a` explained with the 90 percent right / 90 percent wrong / 30 percent right examples; the one-subtraction difference between RLVR and RLCD and what it does to the reliability curve; the actual results with both figures, including anything that did not work; the amputation step and the demo output; what this does and does not say about Jev (it says nothing about their method, it shows the objective is coherent and cheap to test); limitations; link to repo and model. Every number comes from the results files.
+- [ ] **Step 2: Word count and ASCII check.** `(Get-Content docs\article\2026-09-rlcd-toy.md | Measure-Object -Word).Words` must land between 1400 and 1600.
+- [ ] **Step 3: Commit** with message `Add article draft`.
 
 ---
 
