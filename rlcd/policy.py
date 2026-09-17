@@ -92,9 +92,11 @@ def decision_logits(model, input_ids, last_idx, letter_ids: list[int], k: torch.
     """fp32 logits over the 26 letters at each row's decision position.
     Positions at or beyond k are set to NEG so their softmax mass is exactly zero."""
     hidden, aux = eve_hidden(model, input_ids)
-    rows = hidden[torch.arange(hidden.size(0), device=hidden.device), last_idx]
-    weight = model.lm_head.weight[torch.as_tensor(letter_ids, device=hidden.device)]
-    logits = rows.float() @ weight.float().t()
-    positions = torch.arange(MAX_CHOICES, device=logits.device)[None, :]
-    mask = positions >= k.to(logits.device)[:, None]
-    return logits.masked_fill(mask, NEG), aux
+    # Run the head with autocast off: autocast would re-downcast the matmul and quantize the decision logits.
+    with torch.autocast(device_type=hidden.device.type, enabled=False):
+        rows = hidden[torch.arange(hidden.size(0), device=hidden.device), last_idx]
+        weight = model.lm_head.weight[torch.as_tensor(letter_ids, device=hidden.device)]
+        logits = rows.float() @ weight.float().t()
+        positions = torch.arange(MAX_CHOICES, device=logits.device)[None, :]
+        mask = positions >= k.to(logits.device)[:, None]
+        return logits.masked_fill(mask, NEG), aux

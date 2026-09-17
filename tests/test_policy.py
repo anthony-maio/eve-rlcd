@@ -1,8 +1,9 @@
+import pytest
 import torch
 
 from rlcd.compat import eve_config
 from rlcd.eve.modeling_eve import EveMoEForCausalLM
-from rlcd.policy import PAD_ID, decision_logits, encode_batch
+from rlcd.policy import PAD_ID, decision_logits, encode_batch, eve_hidden
 from rlcd.schema import NEG
 
 
@@ -60,6 +61,28 @@ def test_decision_logits_masks_beyond_k():
     assert torch.isfinite(logits).all()
     assert torch.softmax(logits, -1)[0, 2:].sum() == 0
     assert aux.ndim == 0
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_decision_logits_are_fp32_under_bf16_autocast():
+    model = tiny_model().to("cuda")
+    letter_ids = list(range(100, 126))
+    ids, last = encode_batch(FakeTok(), ["short one", "a considerably longer prompt here"], device="cuda")
+    k = torch.tensor([3, 5], device="cuda")
+    with torch.no_grad():
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            logits, aux = decision_logits(model, ids, last, letter_ids, k)
+            hidden, _ = eve_hidden(model, ids)
+        rows = hidden[torch.arange(hidden.size(0), device="cuda"), last]
+        weight = model.lm_head.weight[torch.as_tensor(letter_ids, device="cuda")]
+        ref = rows.float() @ weight.float().t()
+    assert ref.dtype == torch.float32
+    assert logits.dtype == torch.float32
+    assert aux.dtype == torch.float32
+    for i in range(2):
+        assert torch.all(logits[i, k[i]:] == NEG)
+        assert torch.allclose(logits[i, : k[i]], ref[i, : k[i]], atol=1e-2)
 
 
 def _assert_same_model(loaded, model):

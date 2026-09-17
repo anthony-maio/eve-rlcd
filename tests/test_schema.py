@@ -43,9 +43,9 @@ def test_validate_rejects_unknown_primitive():
 
 
 def test_validate_rejects_bad_cardinality():
-    with pytest.raises(ValueError, match="choices"):
+    with pytest.raises(ValueError, match="need 2"):
         q(choices=["only"], answer=0).validate()
-    with pytest.raises(ValueError, match="choices"):
+    with pytest.raises(ValueError, match="need 2"):
         q(choices=[str(i) for i in range(27)], answer=0).validate()
 
 
