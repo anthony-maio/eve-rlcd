@@ -177,7 +177,8 @@ def plot_coverage(preds_by_name: dict[str, list[dict]], out_png, temperature_by_
         _, _, _, conf, correct, _ = _arrays(preds, t)
         cov, err = coverage_error(conf, correct)
         style = run_style(name)
-        ax.plot(cov, err, lw=1.6, ms=5, markevery=max(len(cov) // 10, 1), label=name, **style)
+        every = max(len(cov) // 10, 1)  # markers only tell runs apart; the first sits at 10 percent
+        ax.plot(cov, err, lw=1.6, ms=5, markevery=(min(every, len(cov) - 1), every), label=name, **style)
     ax.set_xlim(0, 1)
     ax.set_ylim(bottom=0)
     ax.set_xlabel("coverage (fraction answered, most confident first)")
