@@ -80,3 +80,20 @@ def entropy_confidence(probs: np.ndarray, k: np.ndarray) -> np.ndarray:
     p = np.clip(np.asarray(probs, float), 1e-12, 1.0)
     h = -(np.asarray(probs, float) * np.log(p)).sum(1)
     return np.clip(1.0 - h / np.log(np.asarray(k, float)), 0.0, 1.0)
+
+
+def bootstrap_ci(fn, arrays: tuple, n_boot: int = 1000, seed: int = 0) -> tuple[float, float]:
+    """95 percent percentile bootstrap interval of fn(*arrays). Rows are resampled with
+    replacement and the same row indices are applied to every array, so paired columns
+    (confidence and correctness, say) stay paired."""
+    arrays = tuple(np.asarray(a) for a in arrays)
+    n = len(arrays[0])
+    if n == 0 or any(len(a) != n for a in arrays):
+        raise ValueError("bootstrap_ci needs non-empty arrays of equal length")
+    rng = np.random.default_rng(seed)
+    stats = np.empty(n_boot)
+    for b in range(n_boot):
+        idx = rng.integers(0, n, n)
+        stats[b] = fn(*(a[idx] for a in arrays))
+    lo, hi = np.percentile(stats, [2.5, 97.5])
+    return float(lo), float(hi)

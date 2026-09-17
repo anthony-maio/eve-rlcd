@@ -137,3 +137,28 @@ def test_entropy_confidence_is_clipped_to_unit_interval():
     assert out[0] == 0.0 and out[1] == 1.0
     third = np.full((1, 3), 1 / 3)
     assert 0.0 <= entropy_confidence(third, np.array([3]))[0] <= 1.0
+
+
+def test_bootstrap_ci_constant_statistic_has_zero_width():
+    from rlcd.metrics import bootstrap_ci
+    lo, hi = bootstrap_ci(lambda x: 0.25, (np.arange(50.0),))
+    assert lo == hi == 0.25
+
+
+def test_bootstrap_ci_covers_the_sample_mean_and_is_reproducible():
+    from rlcd.metrics import bootstrap_ci
+    x = np.random.default_rng(1).normal(loc=3.0, scale=2.0, size=400)
+    lo, hi = bootstrap_ci(lambda a: float(a.mean()), (x,))
+    assert lo < x.mean() < hi
+    # 95 percent interval of a mean is about +-1.96 * sd / sqrt(n) = +-0.196 here.
+    assert 0.25 < hi - lo < 0.55
+    assert (lo, hi) == bootstrap_ci(lambda a: float(a.mean()), (x,))
+    assert (lo, hi) != bootstrap_ci(lambda a: float(a.mean()), (x,), seed=1)
+
+
+def test_bootstrap_ci_resamples_rows_jointly():
+    from rlcd.metrics import bootstrap_ci
+    a = np.arange(200.0)
+    # The statistic is zero only if both arrays are indexed with the same resampled rows.
+    lo, hi = bootstrap_ci(lambda x, y: float(np.abs(x - y).max()), (a, a.copy()), n_boot=50)
+    assert lo == hi == 0.0

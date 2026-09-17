@@ -113,3 +113,21 @@ def test_stride_sample_rejects_non_positive_n():
     for n in (0, -1):
         with pytest.raises(ValueError):
             stride_sample(list(range(10)), n)
+
+
+def test_predict_logits_returns_first_k_fp32_logits_per_row():
+    from rlcd.quick_eval import predict_logits
+    qs = _questions()
+    model = tiny_model().train()
+    letters = list(range(100, 126))
+    rows = predict_logits(model, FakeTok(), letters, qs, max_len=64, batch_size=4, device="cpu")
+    assert model.training
+    assert [len(r) for r in rows] == [q.k for q in qs]
+    assert all(isinstance(v, float) for r in rows for v in r)
+    model.eval()
+    with torch.no_grad():
+        for q, row in zip(qs, rows):
+            ids, last, k = questions_to_batch(FakeTok(), [q], 64, "cpu")
+            ref = decision_logits(model, ids, last, letters, k)[0][0, : q.k]
+            assert torch.allclose(torch.tensor(row), ref, atol=1e-5)
+    assert all(p.grad is None for p in model.parameters())
