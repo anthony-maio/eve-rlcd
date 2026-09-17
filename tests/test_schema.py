@@ -126,7 +126,7 @@ def test_jsonl_roundtrip(tmp_path):
 
 def test_jsonl_roundtrip_unicode_and_crlf(tmp_path):
     path = tmp_path / "qs.jsonl"
-    ctx = "line one\r\nline two café \U0001F600"
+    ctx = "line one\r\nline two caf\u00e9 \U0001F600"
     items = [q(id="u", context=ctx)]
     write_jsonl(path, items)
     back = read_jsonl(path)
