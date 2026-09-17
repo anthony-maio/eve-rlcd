@@ -364,6 +364,25 @@ def test_hf_mlm_reads_the_letters_at_the_mask_position(mask_tok):
     assert aux.item() == 0.0
 
 
+def test_hf_mlm_never_feeds_a_padded_row_to_the_body(mask_tok):
+    """A bidirectional convolution reads one token to the right of the mask, and transformers 4.x
+    does not zero LFM2 padding states, so the policy groups rows by length instead of padding."""
+    policy = HFMaskedLMPolicy(tiny_bert(len(mask_tok)), mask_tok)
+    qs = _questions() + _questions()[:1]  # two rows share a length and go through together
+    shapes = []
+
+    def check(module, args, kwargs):
+        assert kwargs["attention_mask"].all()
+        assert not (kwargs["input_ids"] == policy.pad_id).any()
+        shapes.append(tuple(kwargs["input_ids"].shape))
+
+    policy.model.bert.register_forward_pre_hook(check, with_kwargs=True)
+    with torch.no_grad():
+        logits, _ = policy.decision_logits(qs, max_len=512, device="cpu")
+    assert len(shapes) == 3 and sorted(s[0] for s in shapes) == [1, 1, 2]
+    assert torch.equal(logits[0], logits[3])
+
+
 def test_hf_mlm_truncation_keeps_the_mask_token(mask_tok):
     policy = HFMaskedLMPolicy(tiny_bert(len(mask_tok)), mask_tok)
     ids, mask, pos = policy.encode([_questions()[1]], max_len=16, device="cpu")

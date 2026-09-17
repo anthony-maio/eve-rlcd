@@ -24,7 +24,15 @@ LORA = dict(r=32, lora_alpha=64, lora_dropout=0.0, target_modules="all-linear")
 
 # Hub repos whose custom modeling code has been read and judged safe, each pinned to the exact
 # commit that was read. trust_remote_code is never enabled for anything that is not listed here.
-PINNED_REMOTE_CODE: dict[str, str] = {}
+#
+# LiquidAI/LFM2.5-Encoder-350M, modeling_lfm2_bidirectional.py at the commit below: imports only
+# torch and transformers, touches neither the network nor the file system. It does patch the
+# transformers lfm2 module for the whole process at import time (create_causal_mask becomes a
+# padding-only mask, Lfm2ShortConv becomes a symmetric non-causal convolution). So never load it
+# in a process that also runs a causal LFM2 decoder: that decoder would silently stop being causal.
+PINNED_REMOTE_CODE: dict[str, str] = {
+    "LiquidAI/LFM2.5-Encoder-350M": "b886781f7c6f10ca9b7096e21b83e30a073c2f39",
+}
 
 
 class Policy(Protocol):
@@ -237,6 +245,24 @@ class HFMaskedLMPolicy(_HFPolicy):
 
     def _body(self):
         return self._hf_model().base_model
+
+    def _readout_rows(self, questions, max_len, device) -> torch.Tensor:
+        """Rows go through the body grouped by exact length, never padded. The LFM2 encoder's
+        symmetric convolution reads the token to the right of the mask, and the LFM2 layers of
+        transformers 4.x do not zero padding states (the conv layers are handed the 4D attention
+        mask, which apply_mask_to_padding_states ignores). A causal decoder never looks right,
+        so only this backend pays for it."""
+        ids, mask, last = self.encode(questions, max_len, "cpu")
+        lengths = mask.sum(1)
+        rows: list = [None] * len(questions)
+        body = self._body()
+        for n in sorted(set(lengths.tolist())):
+            index = (lengths == n).nonzero().flatten().tolist()
+            chunk = ids[index, :n].to(device)
+            hidden = body(input_ids=chunk, attention_mask=torch.ones_like(chunk), use_cache=False)[0]
+            for j, i in enumerate(index):
+                rows[i] = hidden[j, n - 1]
+        return torch.stack(rows)
 
     def decision_logits(self, questions, max_len, device):
         """A masked-LM head is more than a matmul (dense, activation, norm, then the decoder),
