@@ -1,5 +1,8 @@
 import copy
+import json
+import sys
 
+import pytest
 import torch
 
 from rlcd import train_rl, train_sft
@@ -145,3 +148,41 @@ def test_training_clis_take_a_backend_lora_and_grad_checkpointing():
         assert (args.backend, args.lora, args.grad_checkpointing) == ("auto", False, False)
         args = parser.parse_args(extra + ["--backend", "hf-decoder", "--lora", "--grad-checkpointing"])
         assert (args.backend, args.lora, args.grad_checkpointing) == ("hf-decoder", True, True)
+
+
+def test_training_clis_take_save_every_and_default_to_off():
+    for parser, extra in ((train_sft.build_parser(), []),
+                          (train_rl.build_parser(), ["--arm", "rlcd", "--out", "unused"])):
+        assert parser.parse_args(extra).save_every == 0
+        assert parser.parse_args(extra + ["--save-every", "100"]).save_every == 100
+
+
+def _rows(n):
+    return [Question("choice", f"ctx {i}", "q", ["a", "b", "c"], answer=i % 3, source="s", id=f"r-{i}")
+            for i in range(n)]
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("script", ["sft", "rl"])
+def test_save_every_writes_the_checkpoint_during_the_run(script, tmp_path, monkeypatch):
+    from rlcd.schema import write_jsonl
+    module = train_sft if script == "sft" else train_rl
+    data = tmp_path / "train.jsonl"
+    write_jsonl(str(data), _rows(40))          # 40 rows, micro 4, accum 1: 10 optimizer steps
+    policy = tiny()
+    policy.model.to("cuda")
+    saves = []
+    monkeypatch.setattr(policy, "save", lambda out, meta: saves.append((out, dict(meta))), raising=False)
+    monkeypatch.setattr(module, "load_policy", lambda *a, **kw: policy)
+    out = tmp_path / "run"
+    argv = ["prog", "--data", str(data), "--init", "unused", "--out", str(out), "--start", "0", "--epochs", "1",
+            "--micro", "4", "--accum", "1", "--max-len", "64", "--save-every", "4"]
+    argv += ["--n", "40"] if script == "sft" else ["--arm", "rlcd"]
+    monkeypatch.setattr(sys, "argv", argv)
+    module.main()
+    assert [meta["steps"] for _, meta in saves] == [4, 8, 10]
+    assert all(path == str(out) for path, _ in saves)
+    assert [bool(meta.get("in_progress")) for _, meta in saves] == [True, True, False]
+    # A periodic checkpoint carries the same run settings as the final one.
+    assert saves[0][1]["save_every"] == 4 and saves[0][1]["slice_rows"] == 40
+    json.dumps(saves[0][1])

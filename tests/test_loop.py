@@ -4,8 +4,8 @@ import random
 import pytest
 import torch
 
-from rlcd.loop import (GradWindow, JsonlLogger, batch_indices, cosine_lr, plan_steps, save_checkpoint,
-                       slice_meta)
+from rlcd.loop import (GradWindow, JsonlLogger, PeriodicSaver, batch_indices, cosine_lr, plan_steps,
+                       save_checkpoint, slice_meta)
 
 
 def test_cosine_lr_warmup_peak_floor():
@@ -117,3 +117,22 @@ def test_save_checkpoint_roundtrips_through_load_eve(tmp_path):
         assert torch.equal(got[name], tensor), name
     assert json.loads((out / "meta.json").read_text()) == {"steps": 7, "arm": "rlcd"}
     assert tok.encode(" A", add_special_tokens=False) == [317]
+
+
+def test_periodic_saver_fires_every_n_steps_but_not_on_the_last():
+    saved = []
+    saver = PeriodicSaver(every=100, total=350, save=saved.append)
+    fired = [step for step in range(1, 351) if saver.after_step(step)]
+    assert fired == saved == [100, 200, 300]
+    # The final step is left to the save at the end of the run, so it is not written twice.
+    saved.clear()
+    saver = PeriodicSaver(every=100, total=300, save=saved.append)
+    assert [step for step in range(1, 301) if saver.after_step(step)] == [100, 200] == saved
+
+
+def test_periodic_saver_is_off_by_default_and_rejects_negative_intervals():
+    saved = []
+    saver = PeriodicSaver(every=0, total=50, save=saved.append)
+    assert not any(saver.after_step(step) for step in range(1, 51)) and saved == []
+    with pytest.raises(ValueError):
+        PeriodicSaver(every=-1, total=50, save=saved.append)

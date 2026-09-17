@@ -21,7 +21,8 @@ from contextlib import nullcontext
 import torch
 
 from rlcd.env import BanditEnv
-from rlcd.loop import GradWindow, JsonlLogger, batch_indices, cosine_lr, plan_steps, slice_meta
+from rlcd.loop import (GradWindow, JsonlLogger, PeriodicSaver, batch_indices, cosine_lr, plan_steps,
+                       slice_meta)
 from rlcd.policies import BACKENDS, Policy, load_policy
 from rlcd.quick_eval import evaluate, stride_sample
 from rlcd.rewards import REWARDS, kl_categorical, policy_gradient_loss, supervised_loss
@@ -120,6 +121,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--eval-every", type=int, default=0)
     ap.add_argument("--eval-n", type=int, default=2000)
     ap.add_argument("--no-save", action="store_true", help="skip the checkpoint; the log is still written")
+    ap.add_argument("--save-every", type=int, default=0,
+                    help="also write the checkpoint to --out every N optimizer steps (0 = only at the end)")
     ap.add_argument("--overwrite", action="store_true", help="replace an existing train_log.jsonl in --out")
     return ap
 
@@ -156,6 +159,9 @@ def main():
     total = plan_steps(len(qs), args.micro, args.accum, args.epochs)
     meta = vars(args) | slice_meta(qs, args.start)
     log.log(arm=args.arm, **slice_meta(qs, args.start), total_steps=total)
+    # A periodic checkpoint overwrites --out in place and is marked in_progress in its meta.json.
+    saver = PeriodicSaver(0 if args.no_save else args.save_every, total,
+                          lambda at: policy.save(args.out, meta | {"steps": at, "stopped": "", "in_progress": True}))
 
     step, last_logged, last_eval, t0 = 0, 0, -1, time.time()
     grads = GradWindow()
@@ -193,6 +199,8 @@ def main():
             last_logged = step
         if eval_qs and step % args.eval_every == 0:
             run_eval()
+        if not stopped:  # a run the stop rule just ended saves once, below
+            saver.after_step(step)
 
     if eval_qs:
         run_eval()  # step 0: every arm's curve starts from the identical warmup point

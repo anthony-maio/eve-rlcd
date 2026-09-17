@@ -72,6 +72,22 @@ def save_checkpoint(model, tokenizer, out_dir: str, meta: dict) -> None:
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
 
 
+class PeriodicSaver:
+    """Calls save(step) after every `every` optimizer steps, so a power cut loses at most that
+    many. every=0 turns it off. The last step is skipped: the run saves at its end anyway."""
+
+    def __init__(self, every: int, total: int, save):
+        if every < 0:
+            raise ValueError(f"save interval must be 0 (off) or positive, got {every}")
+        self.every, self.total, self.save = every, total, save
+
+    def after_step(self, step: int) -> bool:
+        if self.every == 0 or step % self.every != 0 or step >= self.total:
+            return False
+        self.save(step)
+        return True
+
+
 class JsonlLogger:
     def __init__(self, path, overwrite: bool = False):
         """Starts an empty log. Refuses to wipe an existing one unless overwrite is set, so a
