@@ -292,3 +292,17 @@ def test_calibrate_cli_fits_per_primitive_and_applies_to_held_out_preds(tmp_path
     # Logits sharpened 3x are overconfident; the fitted temperature must shrink held-out ECE.
     assert applied["temperature_fitted"]["ece"] < applied["temperature_1"]["ece"]
     assert applied["temperature_fitted"]["acc"] == applied["temperature_1"]["acc"]
+
+
+def test_curves_accepts_an_older_log_without_ece(tmp_path, capsys):
+    new, old = tmp_path / "rlcd", tmp_path / "diag"
+    new.mkdir()
+    old.mkdir()
+    (new / "train_log.jsonl").write_text("".join(
+        json.dumps({"eval_step": s, "eval_acc": 0.5, "eval_ece": 0.05}) + "\n" for s in (0, 50)))
+    (old / "train_log.jsonl").write_text("".join(
+        json.dumps({"eval_step": s, "eval_acc": 0.4}) + "\n" for s in (100, 200)))
+    out = tmp_path / "compare"
+    main(["curves", "--runs", f"rlcd={new}", f"diag={old}", "--out", str(out), "--name", "c.png"])
+    assert (out / "c.png").stat().st_size > 1000
+    assert "diag" in capsys.readouterr().out  # the missing ECE curve is reported, not hidden

@@ -193,7 +193,9 @@ def plot_curves(evals_by_name: dict[str, list[dict]], out_png):
         steps = [r["eval_step"] for r in rows]
         style = run_style(name)
         top.plot(steps, [r["eval_acc"] for r in rows], lw=1.6, ms=5, label=name, **style)
-        bottom.plot(steps, [r["eval_ece"] for r in rows], lw=1.6, ms=5, label=name, **style)
+        with_ece = [r for r in rows if "eval_ece" in r]  # logs older than the ECE column have none
+        bottom.plot([r["eval_step"] for r in with_ece], [r["eval_ece"] for r in with_ece], lw=1.6, ms=5,
+                    label=name, **style)
     top.set_ylabel("held-out accuracy")
     bottom.set_ylabel(f"held-out ECE ({N_BINS} bins)")
     bottom.set_xlabel("optimizer step")
@@ -443,6 +445,8 @@ def cmd_curves(args):
         evals[name] = [r for r in rows if "eval_step" in r]
         if not evals[name]:
             raise SystemExit(f"{path / 'train_log.jsonl'} has no eval rows")
+        if not any("eval_ece" in r for r in evals[name]):
+            print(f"note: {name} logged no eval_ece, so it appears in the accuracy panel only")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     plot_curves(evals, out / args.name)
