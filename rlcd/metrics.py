@@ -42,8 +42,14 @@ def ece(conf: np.ndarray, correct: np.ndarray, n_bins: int = 15) -> float:
 
 
 def coverage_error(conf: np.ndarray, correct: np.ndarray):
-    order = np.argsort(-np.asarray(conf, float), kind="stable")
+    """Error of the most confident fraction, for every fraction. Rows with equal confidence
+    cannot be ranked against each other, so each takes the mean correctness of its tie group
+    and the curve does not depend on input order."""
+    conf = np.asarray(conf, float)
+    order = np.argsort(-conf, kind="stable")
     c = np.asarray(correct, float)[order]
+    _, group = np.unique(conf[order], return_inverse=True)
+    c = (np.bincount(group, weights=c) / np.bincount(group))[group]
     n = len(c)
     covered = np.arange(1, n + 1)
     coverage = covered / n
@@ -52,13 +58,25 @@ def coverage_error(conf: np.ndarray, correct: np.ndarray):
 
 
 def nota_rate(pred: np.ndarray, answers: np.ndarray, nota_index: np.ndarray) -> float:
+    """Recall: among rows where NOTA is the answer, the fraction predicted NOTA."""
+    pred, answers, nota_index = np.asarray(pred), np.asarray(answers), np.asarray(nota_index)
     is_nota_answer = (nota_index >= 0) & (answers == nota_index)
     if not is_nota_answer.any():
         return float("nan")
     return float((pred[is_nota_answer] == nota_index[is_nota_answer]).mean())
 
 
+def nota_false_alarm(pred: np.ndarray, answers: np.ndarray, nota_index: np.ndarray) -> float:
+    """Among rows where NOTA is offered but is not the answer, the fraction predicted NOTA.
+    Read it next to nota_rate: a policy that always abstains scores 1.0 on both."""
+    pred, answers, nota_index = np.asarray(pred), np.asarray(answers), np.asarray(nota_index)
+    is_distractor = (nota_index >= 0) & (answers != nota_index)
+    if not is_distractor.any():
+        return float("nan")
+    return float((pred[is_distractor] == nota_index[is_distractor]).mean())
+
+
 def entropy_confidence(probs: np.ndarray, k: np.ndarray) -> np.ndarray:
     p = np.clip(np.asarray(probs, float), 1e-12, 1.0)
     h = -(np.asarray(probs, float) * np.log(p)).sum(1)
-    return 1.0 - h / np.log(np.asarray(k, float))
+    return np.clip(1.0 - h / np.log(np.asarray(k, float)), 0.0, 1.0)

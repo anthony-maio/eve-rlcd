@@ -13,6 +13,7 @@ class BanditEnv:
 
     def step(self, idx: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         """idx (B,), actions (B,G) -> outcomes (B,G) in {0.0, 1.0}."""
+        assert actions.dim() == 2 and actions.size(0) == idx.numel()
         truth = self._answers[idx.cpu()].to(actions.device)
         return (actions == truth[:, None]).float()
 

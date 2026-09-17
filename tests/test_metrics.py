@@ -1,7 +1,7 @@
 import numpy as np
 
-from rlcd.metrics import (brier, coverage_error, ece, entropy_confidence, nota_rate,
-                          reliability_bins)
+from rlcd.metrics import (brier, coverage_error, ece, entropy_confidence, nota_false_alarm,
+                          nota_rate, reliability_bins)
 
 
 def test_brier_multiclass():
@@ -76,3 +76,64 @@ def test_metrics_accept_plain_lists():
     bc, ba, bn = reliability_bins(conf, correct, n_bins=10)
     assert bn[9] == 2 and bn[5] == 2
     assert abs(bc[9] - 0.95) < 1e-9 and ba[5] == 0.0
+
+
+def test_brier_mixed_k_zero_padded():
+    probs = np.array([[0.6, 0.4, 0.0, 0.0], [0.1, 0.2, 0.3, 0.4]])
+    answers = np.array([0, 3])
+    # row0 (k=2): .4^2 + .4^2 = .32 ; row1 (k=4): .01 + .04 + .09 + .36 = .50 ; mean .41
+    assert abs(brier(probs, answers) - 0.41) < 1e-9
+
+
+def test_ece_and_bins_with_confidence_exactly_one():
+    conf = np.array([1.0, 1.0, 1.0, 1.0])
+    correct = np.array([1, 1, 1, 0])
+    bc, ba, bn = reliability_bins(conf, correct, n_bins=10)
+    assert bn.tolist() == [0] * 9 + [4]
+    assert bc[9] == 1.0 and ba[9] == 0.75
+    assert abs(ece(conf, correct, n_bins=10) - 0.25) < 1e-9
+
+
+def test_coverage_error_is_independent_of_order_within_ties():
+    conf = np.array([1.0, 1.0, 1.0, 1.0, 0.5])
+    cov_a, err_a = coverage_error(conf, np.array([1, 1, 0, 0, 1]))
+    cov_b, err_b = coverage_error(conf, np.array([0, 0, 1, 1, 1]))
+    assert np.allclose(cov_a, cov_b) and np.allclose(err_a, err_b)
+    assert np.allclose(err_a[:4], 0.5)
+    assert abs(err_a[4] - 0.4) < 1e-9
+
+
+def test_nota_recall_and_false_alarm():
+    #                     nota answer | nota distractor | no nota
+    answers = np.array([3, 3, 0, 1, 1])
+    nota_index = np.array([3, 3, 3, 3, -1])
+    pred = np.array([3, 0, 3, 1, 1])
+    assert abs(nota_rate(pred, answers, nota_index) - 0.5) < 1e-9
+    assert abs(nota_false_alarm(pred, answers, nota_index) - 0.5) < 1e-9
+    always_nota = np.where(nota_index >= 0, nota_index, 0)
+    assert nota_rate(always_nota, answers, nota_index) == 1.0
+    assert nota_false_alarm(always_nota, answers, nota_index) == 1.0
+    never_nota = np.zeros(5, dtype=int)
+    assert nota_rate(never_nota, answers, nota_index) == 0.0
+    assert nota_false_alarm(never_nota, answers, nota_index) == 0.0
+    assert np.isnan(nota_false_alarm(pred, answers, np.full(5, -1)))
+    assert np.isnan(nota_false_alarm(np.array([3]), np.array([3]), np.array([3])))
+
+
+def test_nota_metrics_accept_plain_lists():
+    assert nota_rate([3, 0], [3, 3], [3, 3]) == 0.5
+    assert nota_false_alarm([3, 0], [0, 0], [3, 3]) == 0.5
+
+
+def test_entropy_confidence_intermediate_value():
+    out = entropy_confidence(np.array([[0.5, 0.25, 0.25, 0.0]]), np.array([3]))
+    # H = 1.0397 nats, log 3 = 1.0986
+    assert abs(out[0] - 0.0536) < 1e-3
+
+
+def test_entropy_confidence_is_clipped_to_unit_interval():
+    probs = np.array([[0.25, 0.25, 0.25, 0.25], [1.0, 0.0, 0.0, 0.0]])
+    out = entropy_confidence(probs, np.array([2, 4]))  # first row: k understates the support
+    assert out[0] == 0.0 and out[1] == 1.0
+    third = np.full((1, 3), 1 / 3)
+    assert 0.0 <= entropy_confidence(third, np.array([3]))[0] <= 1.0

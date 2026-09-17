@@ -37,9 +37,10 @@ def policy_gradient_loss(logp: torch.Tensor, actions: torch.Tensor, rewards: tor
 
 def kl_categorical(logp: torch.Tensor, logp_ref: torch.Tensor) -> torch.Tensor:
     """KL(p || p_ref) per row. Masked positions carry zero mass in both, so the
-    product is exactly zero there as long as the logits are finite (NEG, not -inf)."""
+    product is exactly zero there as long as the logits are finite (NEG, not -inf).
+    The reference is a constant: no gradient flows into it."""
     p = logp.exp()
-    return (p * (logp - logp_ref)).sum(-1)
+    return (p * (logp - logp_ref.detach())).sum(-1)
 
 
 def supervised_loss(logp: torch.Tensor, answers: torch.Tensor) -> torch.Tensor:
