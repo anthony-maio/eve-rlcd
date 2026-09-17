@@ -21,34 +21,33 @@ from contextlib import nullcontext
 import torch
 
 from rlcd.env import BanditEnv
-from rlcd.loop import (GradWindow, JsonlLogger, batch_indices, cosine_lr, plan_steps, save_checkpoint,
-                       slice_meta)
-from rlcd.policy import decision_logits, load_eve, questions_to_batch
+from rlcd.loop import GradWindow, JsonlLogger, batch_indices, cosine_lr, plan_steps, slice_meta
+from rlcd.policies import BACKENDS, Policy, load_policy
 from rlcd.quick_eval import evaluate, stride_sample
 from rlcd.rewards import REWARDS, kl_categorical, policy_gradient_loss, supervised_loss
-from rlcd.schema import Question, letter_token_ids, read_jsonl
+from rlcd.schema import Question, read_jsonl
 
 ARMS = ("rlvr", "rlcd", "oracle")
 
 
-def rl_step(model, ref_model, tok, letters, batch: list[Question], idx: torch.Tensor, env: BanditEnv,
-            arm: str, group: int, kl_coef: float, aux_coef: float, max_len: int, device: str = "cuda"):
+def rl_step(policy: Policy, ref_policy: Policy | None, batch: list[Question], idx: torch.Tensor,
+            env: BanditEnv, arm: str, group: int, kl_coef: float, aux_coef: float, max_len: int,
+            device: str = "cuda"):
     """One micro-batch: the full loss with grad, and float stats. idx stays on CPU. With
-    ref_model=None there is no reference forward and kl is reported as 0.0. stats["loss"] is
+    ref_policy=None there is no reference forward and kl is reported as 0.0. stats["loss"] is
     the objective without the router aux term, which is reported on its own as stats["aux"]:
     the policy-gradient loss is small next to the aux term and would be hidden by it. The
     oracle arm also reports stats["nll"]."""
     if arm not in ARMS:
         raise ValueError(f"unknown arm {arm}")
-    ids, last, k = questions_to_batch(tok, batch, max_len, device)
     on_cuda = torch.device(device).type == "cuda"
     autocast = torch.autocast("cuda", dtype=torch.bfloat16) if on_cuda else nullcontext()
     with autocast:
-        logits, aux = decision_logits(model, ids, last, letters, k)
+        logits, aux = policy.decision_logits(batch, max_len, device)
         ref_logits = None
-        if ref_model is not None:
+        if ref_policy is not None:
             with torch.no_grad():
-                ref_logits, _ = decision_logits(ref_model, ids, last, letters, k)
+                ref_logits, _ = ref_policy.decision_logits(batch, max_len, device)
     logp = torch.log_softmax(logits, -1)
     probs = logp.exp()
     stats: dict[str, float] = {}
@@ -101,6 +100,9 @@ def should_stop(eval_accs: list[float], base: float, drop: float = 0.10, patienc
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--init", default="runs/warmup")
+    ap.add_argument("--backend", choices=("auto",) + BACKENDS, default="auto")
+    ap.add_argument("--lora", action="store_true", help="train LoRA adapters instead of all weights")
+    ap.add_argument("--grad-checkpointing", action="store_true")
     ap.add_argument("--arm", choices=ARMS, required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--data", default="data/train.jsonl")
@@ -138,18 +140,19 @@ def main():
         eval_qs = stride_sample(read_jsonl(args.eval_data), args.eval_n)
         assert all(q.answer is not None for q in eval_qs), "eval needs a labeled answer on every row"
 
-    model, tok = load_eve(args.init, device="cuda")
-    model.train()
-    ref_model = None
+    policy = load_policy(args.init, device="cuda", backend=args.backend, lora=args.lora,
+                         grad_checkpointing=args.grad_checkpointing)
+    policy.train()
+    params = list(policy.trainable_parameters())  # taken before the frozen reference copy exists
+    ref_policy = None
     if args.kl > 0:
         # Keep the reference in fp32. Eve's RoPE buffer is complex64 and Module.to(bfloat16)
         # would silently drop its imaginary part.
-        ref_model = copy.deepcopy(model).eval()
-        for p in ref_model.parameters():
+        ref_policy = copy.deepcopy(policy).eval()
+        for p in ref_policy.model.parameters():
             p.requires_grad_(False)
-    letters = letter_token_ids(tok)
-    aux_coef = model.config.router_aux_loss_coef
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
+    aux_coef = policy.aux_coef()
+    opt = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
     total = plan_steps(len(qs), args.micro, args.accum, args.epochs)
     meta = vars(args) | slice_meta(qs, args.start)
     log.log(arm=args.arm, **slice_meta(qs, args.start), total_steps=total)
@@ -163,7 +166,7 @@ def main():
 
     def run_eval() -> None:
         nonlocal stopped, last_eval
-        result = evaluate(model, tok, letters, eval_qs, args.max_len)
+        result = evaluate(policy, eval_qs, args.max_len)
         log.log(eval_step=step, **result, sec=time.time() - t0)
         last_eval = step
         eval_accs.append(result["eval_acc"])
@@ -172,10 +175,10 @@ def main():
 
     def optimizer_step(epoch: int) -> None:
         nonlocal step, sums, row, last_logged
-        n = grads.finish(model.parameters())
+        n = grads.finish(params)
         for g in opt.param_groups:
             g["lr"] = cosine_lr(step + 1, total, args.lr, warmup=max(1, total // 20))
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
+        grad_norm = torch.nn.utils.clip_grad_norm_(params, 1.0).item()
         opt.step()
         opt.zero_grad(set_to_none=True)
         step += 1
@@ -196,7 +199,7 @@ def main():
     for epoch in range(args.epochs):
         for idx in batch_indices(len(qs), args.micro, rng):
             batch = [qs[i] for i in idx]
-            loss, stats = rl_step(model, ref_model, tok, letters, batch, torch.tensor(idx), env,
+            loss, stats = rl_step(policy, ref_policy, batch, torch.tensor(idx), env,
                                   args.arm, args.group, args.kl, aux_coef, args.max_len)
             if not math.isfinite(loss.item()):
                 stopped = "non-finite loss"
@@ -226,7 +229,7 @@ def main():
     elif stopped == "non-finite loss":
         print("checkpoint skipped (non-finite loss)")
     else:
-        save_checkpoint(model, tok, args.out, meta | {"steps": step, "stopped": stopped})
+        policy.save(args.out, meta | {"steps": step, "stopped": stopped})
         print("saved", args.out)
     print(f"wall_sec={time.time() - t0:.1f} peak_vram_mb={torch.cuda.max_memory_allocated() // 2**20}")
 

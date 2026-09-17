@@ -10,6 +10,7 @@ from rlcd.compat import eve_config
 from rlcd.data import DEPARTMENTS, synthetic_triage
 from rlcd.eval import build_probe, main, predict, probe_report, summarize, to_json
 from rlcd.eve.modeling_eve import EveMoEForCausalLM
+from rlcd.policies import EvePolicy
 from rlcd.schema import NOTA, Question
 
 GROUP_KEYS = {"n", "acc", "brier", "ece", "nota_rate", "nota_false_alarm", "mean_conf", "conf_minus_acc"}
@@ -109,7 +110,8 @@ def test_predict_rows_carry_ids_logits_and_nota_index():
     model = EveMoEForCausalLM(cfg)
     qs = [Question("choice", "ctx", "pick", ["x", "y", NOTA], answer=2, source="alpha", id="a-1"),
           Question("noul", "ctx", "is it", ["true", "false"], answer=1, source="beta", id="b-1")]
-    preds = predict(model, FakeTok(), qs, max_len=64, batch_size=1, device="cpu", letters=list(range(100, 126)))
+    policy = EvePolicy(model, FakeTok(), list(range(100, 126)))
+    preds = predict(policy, qs, max_len=64, batch_size=1, device="cpu")
     assert [set(p) for p in preds] == [{"id", "source", "primitive", "k", "answer", "logits", "nota_index"}] * 2
     assert [p["id"] for p in preds] == ["a-1", "b-1"]
     assert [len(p["logits"]) for p in preds] == [3, 2]

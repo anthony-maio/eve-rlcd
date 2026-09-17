@@ -12,6 +12,7 @@ dependencies = [
     "numpy>=2",
     "matplotlib>=3.9",
     "tqdm>=4.66",
+    "peft>=0.21.0",
 ]
 
 [dependency-groups]

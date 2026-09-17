@@ -6,6 +6,7 @@ import torch
 
 from rlcd.compat import eve_config
 from rlcd.eve.modeling_eve import EveMoEForCausalLM
+from rlcd.policies import EvePolicy
 from rlcd.policy import decision_logits, questions_to_batch
 from rlcd.quick_eval import evaluate, stride_sample
 from rlcd.schema import Question
@@ -36,7 +37,7 @@ def _questions() -> list[Question]:
 def test_evaluate_reports_metrics_and_restores_train_mode():
     qs = _questions()
     model = tiny_model().train()
-    out = evaluate(model, FakeTok(), list(range(100, 126)), qs, max_len=64, device="cpu")
+    out = evaluate(EvePolicy(model, FakeTok(), list(range(100, 126))), qs, max_len=64, device="cpu")
     assert set(out) == {"eval_acc", "eval_nll", "eval_conf", "eval_pred_last", "eval_ece",
                         "eval_brier", "eval_entropy", "eval_acc_alpha", "eval_acc_beta"}
     for key in ("eval_acc", "eval_conf", "eval_pred_last", "eval_ece", "eval_acc_alpha", "eval_acc_beta"):
@@ -52,8 +53,8 @@ def test_evaluate_reports_metrics_and_restores_train_mode():
 def test_evaluate_restores_eval_mode_and_does_not_depend_on_batch_size():
     qs = _questions()
     model = tiny_model().eval()
-    a = evaluate(model, FakeTok(), list(range(100, 126)), qs, max_len=64, batch_size=32, device="cpu")
-    b = evaluate(model, FakeTok(), list(range(100, 126)), qs, max_len=64, batch_size=2, device="cpu")
+    a = evaluate(EvePolicy(model, FakeTok(), list(range(100, 126))), qs, max_len=64, batch_size=32, device="cpu")
+    b = evaluate(EvePolicy(model, FakeTok(), list(range(100, 126))), qs, max_len=64, batch_size=2, device="cpu")
     assert not model.training
     for key in a:
         assert abs(a[key] - b[key]) < 1e-5, key
@@ -75,7 +76,7 @@ def test_evaluate_matches_a_row_at_a_time_reference_and_leaves_no_grads():
             logp = torch.log_softmax(decision_logits(model, ids, last, letters, k)[0], -1)[0]
             nll.append(-logp[q.answer].item())
             hits.append(float(logp.argmax().item() == q.answer))
-    out = evaluate(model, FakeTok(), letters, qs, max_len=128, device="cpu")
+    out = evaluate(EvePolicy(model, FakeTok(), letters), qs, max_len=128, device="cpu")
     assert abs(out["eval_nll"] - sum(nll) / len(nll)) < 1e-5
     assert out["eval_acc"] == sum(hits) / len(hits)
     assert all(p.grad is None for p in model.parameters())
@@ -89,7 +90,7 @@ def test_evaluate_restores_the_mode_when_the_forward_raises():
 
     model = tiny_model().train()
     with pytest.raises(RuntimeError):
-        evaluate(model, Boom(), list(range(100, 126)), _questions(), max_len=64, device="cpu")
+        evaluate(EvePolicy(model, Boom(), list(range(100, 126))), _questions(), max_len=64, device="cpu")
     assert model.training
 
 
@@ -120,7 +121,7 @@ def test_predict_logits_returns_first_k_fp32_logits_per_row():
     qs = _questions()
     model = tiny_model().train()
     letters = list(range(100, 126))
-    rows = predict_logits(model, FakeTok(), letters, qs, max_len=64, batch_size=4, device="cpu")
+    rows = predict_logits(EvePolicy(model, FakeTok(), letters), qs, max_len=64, batch_size=4, device="cpu")
     assert model.training
     assert [len(r) for r in rows] == [q.k for q in qs]
     assert all(isinstance(v, float) for r in rows for v in r)

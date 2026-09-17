@@ -16,7 +16,7 @@ from rlcd.data import DEPARTMENTS, DEPT_CUES, PRIO_CUES, PRIORITIES, shuffle_cho
 from rlcd.metrics import (bootstrap_ci, brier, coverage_error, ece, nota_false_alarm, nota_rate,
                           reliability_bins)
 from rlcd.quick_eval import log_probs, predict_logits, stride_sample
-from rlcd.schema import NOTA, Question, letter_token_ids, read_jsonl
+from rlcd.schema import NOTA, Question, read_jsonl
 
 N_BINS = 15
 
@@ -51,12 +51,10 @@ def load_preds(path) -> list[dict]:
 
 # ---------- predictions and metrics ----------
 
-def predict(model, tok, questions: list[Question], max_len: int = 512, batch_size: int = 32,
-            device: str = "cuda", letters: list[int] | None = None) -> list[dict]:
-    """One row per question with the first k decision logits. letters defaults to the
-    tokenizer's letter token ids; tests pass their own."""
-    letters = letter_token_ids(tok) if letters is None else letters
-    rows = predict_logits(model, tok, letters, questions, max_len, batch_size, device)
+def predict(policy, questions: list[Question], max_len: int = 512, batch_size: int = 32,
+            device: str = "cuda") -> list[dict]:
+    """One row per question with the first k decision logits."""
+    rows = predict_logits(policy, questions, max_len, batch_size, device)
     return [{"id": q.id, "source": q.source, "primitive": q.primitive, "k": q.k, "answer": q.answer,
              "logits": row, "nota_index": q.choices.index(NOTA) if NOTA in q.choices else -1}
             for q, row in zip(questions, rows)]
@@ -323,12 +321,12 @@ def _write_preds(path, preds: list[dict]) -> None:
 
 
 def cmd_run(args):
-    from rlcd.policy import load_eve
-    model, tok = load_eve(args.model, device=args.device)
+    from rlcd.policies import load_policy
+    policy = load_policy(args.model, device=args.device, backend=args.backend)
     qs = read_jsonl(args.split)
     if args.limit:
         qs = stride_sample(qs, args.limit)
-    preds = predict(model, tok, qs, args.max_len, args.batch_size, args.device)
+    preds = predict(policy, qs, args.max_len, args.batch_size, args.device)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     _write_preds(out / "preds.jsonl", preds)
@@ -344,11 +342,11 @@ def cmd_run(args):
 
 
 def cmd_probe(args):
-    from rlcd.policy import load_eve
+    from rlcd.policies import load_policy
     train_contexts = {q.context for q in read_jsonl(args.train)}
     items, dropped = build_probe(args.n_tickets, args.seed, train_contexts)
-    model, tok = load_eve(args.model, device=args.device)
-    preds = predict(model, tok, [q for q, _ in items], args.max_len, args.batch_size, args.device)
+    policy = load_policy(args.model, device=args.device, backend=args.backend)
+    preds = predict(policy, [q for q, _ in items], args.max_len, args.batch_size, args.device)
     probs = np.exp(log_probs([p["logits"] for p in preds]))
     rows = [{**meta, "id": q.id, "label": q.answer, "probs": probs[i, : q.k].tolist()}
             for i, (q, meta) in enumerate(items)]
@@ -465,6 +463,7 @@ def main(argv=None):
         p.add_argument("--max-len", type=int, default=512)
         p.add_argument("--batch-size", type=int, default=32)
         p.add_argument("--device", default="cuda")
+        p.add_argument("--backend", choices=("auto", "eve", "hf-decoder", "hf-mlm"), default="auto")
 
     r = sub.add_parser("run", help="predict a split, write preds.jsonl, metrics.json, and two plots")
     model_args(r)

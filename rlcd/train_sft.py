@@ -7,12 +7,12 @@ import time
 
 import torch
 
-from rlcd.loop import (GradWindow, JsonlLogger, batch_indices, cosine_lr, plan_steps, save_checkpoint,
-                       slice_meta)
-from rlcd.policy import EVE_ID, decision_logits, load_eve, questions_to_batch
+from rlcd.loop import GradWindow, JsonlLogger, batch_indices, cosine_lr, plan_steps, slice_meta
+from rlcd.policies import BACKENDS, load_policy
+from rlcd.policy import EVE_ID
 from rlcd.quick_eval import evaluate, stride_sample
 from rlcd.rewards import supervised_loss
-from rlcd.schema import Question, letter_token_ids, read_jsonl
+from rlcd.schema import Question, read_jsonl
 
 
 def select_slice(rows: list, start: int, n: int) -> list:
@@ -25,6 +25,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="data/train.jsonl")
     ap.add_argument("--init", default=EVE_ID)
+    ap.add_argument("--backend", choices=("auto",) + BACKENDS, default="auto")
+    ap.add_argument("--lora", action="store_true", help="train LoRA adapters instead of all weights")
+    ap.add_argument("--grad-checkpointing", action="store_true")
     ap.add_argument("--out", default="runs/sft")
     ap.add_argument("--start", type=int, default=0, help="first row of the slice, in file order")
     ap.add_argument("--n", type=int, default=32000, help="number of rows in the slice")
@@ -58,11 +61,12 @@ def main():
         eval_qs = stride_sample(read_jsonl(args.eval_data), args.eval_n)
         assert all(q.answer is not None for q in eval_qs), "eval needs a labeled answer on every row"
 
-    model, tok = load_eve(args.init, device="cuda")
-    model.train()
-    letters = letter_token_ids(tok)
-    aux_coef = model.config.router_aux_loss_coef
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
+    policy = load_policy(args.init, device="cuda", backend=args.backend, lora=args.lora,
+                         grad_checkpointing=args.grad_checkpointing)
+    policy.train()
+    aux_coef = policy.aux_coef()
+    params = list(policy.trainable_parameters())
+    opt = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
     total = plan_steps(len(qs), args.micro, args.accum, args.epochs)
     meta = vars(args) | slice_meta(qs, args.start)
     log.log(**slice_meta(qs, args.start), total_steps=total)
@@ -74,15 +78,15 @@ def main():
 
     def run_eval() -> None:
         nonlocal last_eval
-        log.log(eval_step=step, **evaluate(model, tok, letters, eval_qs, args.max_len), sec=time.time() - t0)
+        log.log(eval_step=step, **evaluate(policy, eval_qs, args.max_len), sec=time.time() - t0)
         last_eval = step
 
     def optimizer_step(epoch: int) -> None:
         nonlocal step, row, last_logged
-        n = grads.finish(model.parameters())
+        n = grads.finish(params)
         for g in opt.param_groups:
             g["lr"] = cosine_lr(step + 1, total, args.lr, warmup=max(1, total // 20))
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
+        grad_norm = torch.nn.utils.clip_grad_norm_(params, 1.0).item()
         opt.step()
         opt.zero_grad(set_to_none=True)
         step += 1
@@ -102,9 +106,8 @@ def main():
     for epoch in range(args.epochs):
         for idx in batch_indices(len(qs), args.micro, rng):
             batch = [qs[i] for i in idx]
-            ids, last, k = questions_to_batch(tok, batch, args.max_len, "cuda")
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                logits, aux = decision_logits(model, ids, last, letters, k)
+                logits, aux = policy.decision_logits(batch, args.max_len, "cuda")
             logp = torch.log_softmax(logits, -1)
             nll = supervised_loss(logp, answers[idx])
             grads.backward(nll + aux_coef * aux, len(idx))
@@ -127,7 +130,7 @@ def main():
     if args.no_save:
         print("checkpoint skipped (--no-save)")
     else:
-        save_checkpoint(model, tok, args.out, meta | {"steps": step})
+        policy.save(args.out, meta | {"steps": step})
         print("saved", args.out)
     print(f"wall_sec={time.time() - t0:.1f} peak_vram_mb={torch.cuda.max_memory_allocated() // 2**20}")
 

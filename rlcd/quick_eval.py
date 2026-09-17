@@ -5,7 +5,6 @@ import numpy as np
 import torch
 
 from rlcd.metrics import brier, ece
-from rlcd.policy import decision_logits, questions_to_batch
 from rlcd.schema import NEG, Question
 
 
@@ -18,25 +17,24 @@ def stride_sample(items: list, n: int) -> list:
     return [items[i * len(items) // m] for i in range(m)]
 
 
-def predict_logits(model, tok, letters, questions: list[Question], max_len: int = 512,
+def predict_logits(policy, questions: list[Question], max_len: int = 512,
                    batch_size: int = 32, device: str = "cuda") -> list[list[float]]:
     """The first k fp32 decision logits of every question, in input order. Runs in eval mode
     without grad and restores the previous training mode, also when the forward raises."""
     device_type = torch.device(device).type
-    was_training = model.training
-    model.eval()
+    was_training = policy.training
+    policy.eval()
     rows: list[list[float]] = []
     try:
         with torch.no_grad():
             for i in range(0, len(questions), batch_size):
                 batch = questions[i:i + batch_size]
-                ids, last, k = questions_to_batch(tok, batch, max_len, device)
                 with torch.autocast(device_type, dtype=torch.bfloat16, enabled=device_type == "cuda"):
-                    logits, _ = decision_logits(model, ids, last, letters, k)
+                    logits, _ = policy.decision_logits(batch, max_len, device)
                 for q, row in zip(batch, logits.float().cpu()):
                     rows.append(row[: q.k].tolist())
     finally:
-        model.train(was_training)
+        policy.train(was_training)
     return rows
 
 
@@ -51,13 +49,13 @@ def log_probs(rows: list[list[float]], temperature: float = 1.0) -> np.ndarray:
     return out
 
 
-def evaluate(model, tok, letters, questions: list[Question], max_len: int = 512, batch_size: int = 32,
+def evaluate(policy, questions: list[Question], max_len: int = 512, batch_size: int = 32,
              device: str = "cuda") -> dict:
     """Accuracy, NLL of the true answer, max-probability confidence, last-option rate, ECE
     (15 bins on max-probability confidence), Brier loss, and mean entropy in nats over the
     declared options, plus accuracy per source. Runs in eval mode without grad and restores
     the previous training mode."""
-    logp = log_probs(predict_logits(model, tok, letters, questions, max_len, batch_size, device))
+    logp = log_probs(predict_logits(policy, questions, max_len, batch_size, device))
     p = np.exp(logp)
     answers = np.array([q.answer for q in questions])
     k = np.array([q.k for q in questions])
