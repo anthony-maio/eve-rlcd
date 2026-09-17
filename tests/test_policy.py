@@ -63,6 +63,17 @@ def test_decision_logits_masks_beyond_k():
     assert aux.ndim == 0
 
 
+def test_decision_logits_match_full_forward():
+    model = tiny_model()
+    letter_ids = list(range(100, 126))
+    ids, last = encode_batch(FakeTok(), ["short one", "a considerably longer prompt here"])
+    with torch.no_grad():
+        got, _ = decision_logits(model, ids, last, letter_ids, torch.tensor([26, 26]))
+        full = model(input_ids=ids).logits
+    want = torch.stack([full[i, last[i], letter_ids] for i in range(2)])
+    assert torch.allclose(got, want, atol=1e-5)
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 def test_decision_logits_are_fp32_under_bf16_autocast():
@@ -82,7 +93,7 @@ def test_decision_logits_are_fp32_under_bf16_autocast():
     assert aux.dtype == torch.float32
     for i in range(2):
         assert torch.all(logits[i, k[i]:] == NEG)
-        assert torch.allclose(logits[i, : k[i]], ref[i, : k[i]], atol=1e-2)
+        assert torch.allclose(logits[i, : k[i]], ref[i, : k[i]], atol=1e-6)
 
 
 def _assert_same_model(loaded, model):
@@ -129,7 +140,6 @@ def test_load_eve_reads_a_hub_style_checkpoint(tmp_path):
 
 
 def test_load_eve_rejects_a_checkpoint_with_missing_weights(tmp_path):
-    import pytest
     from safetensors.torch import save_file
     from transformers import AutoTokenizer
 
@@ -141,4 +151,20 @@ def test_load_eve_rejects_a_checkpoint_with_missing_weights(tmp_path):
     model.config.save_pretrained(tmp_path)
     AutoTokenizer.from_pretrained("gpt2").save_pretrained(tmp_path)
     with pytest.raises(RuntimeError, match="router"):
+        load_eve(str(tmp_path), device="cpu")
+
+
+def test_load_eve_rejects_untied_lm_head_and_wte(tmp_path):
+    from safetensors.torch import save_file
+    from transformers import AutoTokenizer
+
+    from rlcd.policy import load_eve
+    model = tiny_model()
+    sd = {k: v.clone().contiguous() for k, v in model.state_dict().items()}
+    assert "lm_head.weight" in sd and "transformer.wte.weight" in sd
+    sd["lm_head.weight"] = sd["lm_head.weight"] + 1.0
+    save_file(sd, str(tmp_path / "model.safetensors"))
+    model.config.save_pretrained(tmp_path)
+    AutoTokenizer.from_pretrained("gpt2").save_pretrained(tmp_path)
+    with pytest.raises(RuntimeError, match="untied lm_head and wte"):
         load_eve(str(tmp_path), device="cpu")
