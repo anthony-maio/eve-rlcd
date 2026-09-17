@@ -11,14 +11,15 @@ def brier(probs: np.ndarray, answers: np.ndarray) -> float:
 
 
 def _bin_ids(conf: np.ndarray, n_bins: int) -> np.ndarray:
-    edges = np.linspace(0.0, 1.0, n_bins + 1)
-    ids = np.searchsorted(edges, conf, side="right") - 1
-    return np.clip(ids, 0, n_bins - 1)
+    """Bins are [lo, hi) with 1.0 in the last bin. The epsilon keeps values that sit on an
+    edge (0.3, 0.6, 0.7 with 10 bins) from falling into the lower bin through float error."""
+    return np.clip(np.floor(conf * n_bins + 1e-9).astype(int), 0, n_bins - 1)
 
 
 def reliability_bins(conf: np.ndarray, correct: np.ndarray, n_bins: int = 15):
-    ids = _bin_ids(np.asarray(conf, float), n_bins)
+    conf = np.asarray(conf, float)
     correct = np.asarray(correct, float)
+    ids = _bin_ids(conf, n_bins)
     bin_conf = np.full(n_bins, np.nan)
     bin_acc = np.full(n_bins, np.nan)
     bin_count = np.zeros(n_bins, dtype=int)

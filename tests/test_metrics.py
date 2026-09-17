@@ -58,3 +58,21 @@ def test_entropy_confidence():
     out = entropy_confidence(probs, k)
     assert abs(out[0] - 1.0) < 1e-9
     assert abs(out[1] - 0.0) < 1e-9
+
+
+def test_bin_edges_go_to_the_upper_bin():
+    conf = np.array([0.0, 0.1, 0.3, 0.6, 0.7, 0.9, 1.0])
+    _, _, bn = reliability_bins(conf, np.ones(len(conf)), n_bins=10)
+    expected = np.zeros(10, dtype=int)
+    for b in [0, 1, 3, 6, 7, 9, 9]:
+        expected[b] += 1
+    assert bn.tolist() == expected.tolist()
+
+
+def test_metrics_accept_plain_lists():
+    conf = [0.95, 0.95, 0.55, 0.55]
+    correct = [1, 1, 0, 0]
+    assert abs(ece(conf, correct, n_bins=10) - 0.30) < 1e-9
+    bc, ba, bn = reliability_bins(conf, correct, n_bins=10)
+    assert bn[9] == 2 and bn[5] == 2
+    assert abs(bc[9] - 0.95) < 1e-9 and ba[5] == 0.0

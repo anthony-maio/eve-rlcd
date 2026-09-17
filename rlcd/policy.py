@@ -37,7 +37,7 @@ def _load_weights(model: EveMoEForCausalLM, path_or_id: str) -> None:
     if ("lm_head.weight" in sd and "transformer.wte.weight" in sd
             and not torch.equal(sd["lm_head.weight"], sd["transformer.wte.weight"])):
         raise RuntimeError("checkpoint has untied lm_head and wte weights")
-    ref =sd.get("lm_head.weight", sd.get("transformer.wte.weight"))
+    ref = sd.get("lm_head.weight", sd.get("transformer.wte.weight"))
     if ref is None:
         raise RuntimeError("checkpoint has neither lm_head.weight nor transformer.wte.weight")
     sd["lm_head.weight"] = sd["transformer.wte.weight"] = ref
