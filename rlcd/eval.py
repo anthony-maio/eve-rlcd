@@ -13,12 +13,17 @@ from pathlib import Path
 import numpy as np
 
 from rlcd.data import DEPARTMENTS, DEPT_CUES, PRIO_CUES, PRIORITIES, shuffle_choices, synthetic_triage
-from rlcd.metrics import (bootstrap_ci, brier, coverage_error, ece, nota_false_alarm, nota_rate,
-                          reliability_bins)
+from rlcd.metrics import (bootstrap_ci, bootstrap_stats, brier, coverage_error, ece, nota_false_alarm,
+                          nota_rate, paired_bootstrap_diff, reliability_bins)
 from rlcd.quick_eval import log_probs, predict_logits, stride_sample
 from rlcd.schema import NOTA, Question, read_jsonl
 
 N_BINS = 15
+MIN_BIN_ROWS = 30  # reliability bins with fewer rows are too noisy to draw; they stay in the JSON
+ECE_NOTE = ("Note on ECE: plug-in ECE is biased upward, and its percentile bootstrap interval inherits that "
+            "bias, so the intervals of well calibrated runs sit high (often above the point estimate). "
+            "ECE bias is the bootstrap mean minus the point estimate. For comparisons between runs use the "
+            "paired differences (compare --pairs), not overlap of these intervals.")
 
 
 # ---------- json ----------
@@ -42,6 +47,13 @@ def _json_safe(obj):
 
 def to_json(obj) -> str:
     return json.dumps(_json_safe(obj), indent=2, allow_nan=False)
+
+
+def write_rows(path, rows: list[dict]) -> None:
+    """One strict-JSON object per line; NaN and infinities become null, as in to_json."""
+    with open(path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(_json_safe(row), allow_nan=False) + "\n")
 
 
 def load_preds(path) -> list[dict]:
@@ -76,6 +88,14 @@ def _row_brier(probs: np.ndarray, answers: np.ndarray) -> np.ndarray:
     return ((probs - onehot) ** 2).sum(1)
 
 
+def _mean_stat(values: np.ndarray) -> float:
+    return float(values.mean())
+
+
+def _ece_stat(conf: np.ndarray, correct: np.ndarray) -> float:
+    return ece(conf, correct, N_BINS)
+
+
 def _group_metrics(preds: list[dict], temperature: float, with_ci: bool = False) -> dict:
     probs, answers, pred, conf, correct, nota_index = _arrays(preds, temperature)
     acc, mean_conf = float(correct.mean()), float(conf.mean())
@@ -84,15 +104,54 @@ def _group_metrics(preds: list[dict], temperature: float, with_ci: bool = False)
            "nota_false_alarm": nota_false_alarm(pred, answers, nota_index),
            "mean_conf": mean_conf, "conf_minus_acc": mean_conf - acc}
     if with_ci:
-        out["ci"] = {"acc": list(bootstrap_ci(lambda c: float(c.mean()), (correct,))),
-                     "ece": list(bootstrap_ci(lambda f, c: ece(f, c, N_BINS), (conf, correct))),
-                     "brier": list(bootstrap_ci(lambda b: float(b.mean()), (_row_brier(probs, answers),)))}
+        ece_boot = bootstrap_stats(_ece_stat, (conf, correct))
+        out["ci"] = {"acc": list(bootstrap_ci(_mean_stat, (correct,))),
+                     "ece": [float(x) for x in np.percentile(ece_boot, [2.5, 97.5])],
+                     "brier": list(bootstrap_ci(_mean_stat, (_row_brier(probs, answers),)))}
+        out["ece_bias"] = float(ece_boot.mean() - out["ece"])
+        bin_conf, bin_acc, bin_count = reliability_bins(conf, correct, N_BINS)
+        out["reliability"] = {"bin_conf": bin_conf.tolist(), "bin_acc": bin_acc.tolist(),
+                              "bin_count": bin_count.tolist()}
     return out
+
+
+def paired_differences(preds_a: list[dict], preds_b: list[dict]) -> dict:
+    """a minus b for accuracy, ECE, and Brier loss at temperature 1, each with a paired 95 percent
+    bootstrap interval. Both runs must have been evaluated on the same rows in the same order."""
+    if [p["id"] for p in preds_a] != [p["id"] for p in preds_b]:
+        raise ValueError("the two runs were not evaluated on the same rows in the same order")
+    pa, ans_a, _, conf_a, correct_a, _ = _arrays(preds_a, 1.0)
+    pb, ans_b, _, conf_b, correct_b, _ = _arrays(preds_b, 1.0)
+    out = {}
+    for key, fn, a, b in (("acc", _mean_stat, (correct_a,), (correct_b,)),
+                          ("ece", _ece_stat, (conf_a, correct_a), (conf_b, correct_b)),
+                          ("brier", _mean_stat, (_row_brier(pa, ans_a),), (_row_brier(pb, ans_b),))):
+        diff, lo, hi = paired_bootstrap_diff(fn, a, b)
+        out[key] = {"diff": diff, "lo": lo, "hi": hi}
+    return out
+
+
+def overall_text(m: dict) -> str:
+    """The overall block as labelled lines for the console."""
+    lines = [f"n                              {m['n']}",
+             f"acc                            {_fmt(m['acc'])}",
+             f"Brier loss (lower is better)   {_fmt(m['brier'])}",
+             f"ECE ({N_BINS} bins)                  {_fmt(m['ece'])}",
+             f"mean conf                      {_fmt(m['mean_conf'])}",
+             f"conf minus acc                 {_fmt(m['conf_minus_acc'])}",
+             f"NOTA recall                    {_fmt(m['nota_rate'])}",
+             f"NOTA false alarm               {_fmt(m['nota_false_alarm'])}"]
+    if "ci" in m:
+        for i, key in ((1, "acc"), (2, "brier"), (3, "ece")):
+            lines[i] += f"  [{m['ci'][key][0]:.3f}, {m['ci'][key][1]:.3f}]"
+        lines[3] += f"  bias {m['ece_bias']:+.3f}"
+    return "\n".join(lines)
 
 
 def summarize(preds: list[dict], temperature: float = 1.0) -> dict:
     """Metrics overall, by primitive, and by source. Brier is a loss: lower is better. overall
-    also carries 95 percent bootstrap intervals (1000 row resamples, seed 0) under "ci"."""
+    also carries 95 percent bootstrap intervals (1000 row resamples, seed 0) under "ci", ece_bias
+    (bootstrap mean of ECE minus the point estimate; see ECE_NOTE), and every reliability bin."""
     result = {"overall": _group_metrics(preds, temperature, with_ci=True), "by_primitive": {}, "by_source": {}}
     for key, field in (("by_primitive", "primitive"), ("by_source", "source")):
         for name in sorted({p[field] for p in preds}):
@@ -103,8 +162,10 @@ def summarize(preds: list[dict], temperature: float = 1.0) -> dict:
 # ---------- plots ----------
 
 # One fixed look per run, used by every figure. Known runs are listed; any other name gets a
-# stable palette slot from its crc32 and a dashed line, so it looks the same in every figure.
-PALETTE = ["#2a78d6", "#e34948", "#008300", "#eda100", "#4a3aa7", "#eb6834", "#1baf7a", "#e87ba4"]
+# stable slot of the fallback palette from its crc32 and a dashed line, so it looks the same in
+# every figure. The fallback palette shares no color with the listed runs, so an unlisted run is
+# never mistaken for a listed one. A q- run repeats the color of the Eve run with the same role.
+FALLBACK_PALETTE = ["#17becf", "#bcbd22", "#a0522d", "#c000c0", "#1f2f6b", "#006d6f"]
 MARKERS = ["o", "s", "^", "D", "v", "P", "X", "<", ">", "h"]
 RUN_STYLE = {
     "rlcd": ("#2a78d6", "o", "-"),
@@ -116,6 +177,12 @@ RUN_STYLE = {
     "diag-lr5e-5": ("#1baf7a", "P", "-"),
     "rlcd-kl05": ("#eb6834", "h", "-"),
     "zeroshot": ("#6f6d68", "<", ":"),
+    "q-rlcd": ("#2a78d6", "o", "-"),
+    "q-rlvr": ("#e34948", "X", "-"),
+    "q-rlvr-lowlr": ("#e87ba4", "D", "-"),
+    "q-oracle": ("#008300", "^", "-"),
+    "q-warmup": ("#4a3aa7", "v", "-"),
+    "bake-qwen06": ("#eda100", "s", "-"),
 }
 
 
@@ -124,7 +191,8 @@ def run_style(name: str) -> dict:
         color, marker, linestyle = RUN_STYLE[name]
     else:
         h = zlib.crc32(name.encode("utf-8"))
-        color, marker, linestyle = PALETTE[h % len(PALETTE)], MARKERS[(h // 8) % len(MARKERS)], "--"
+        color = FALLBACK_PALETTE[h % len(FALLBACK_PALETTE)]
+        marker, linestyle = MARKERS[(h // 8) % len(MARKERS)], "--"
     return {"color": color, "marker": marker, "linestyle": linestyle}
 
 
@@ -147,6 +215,13 @@ def _finish(fig, axes, out_png, legend_ax=None):
     fig.savefig(out_png, dpi=150, bbox_inches="tight", facecolor="white")
 
 
+def reliability_points(conf: np.ndarray, correct: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Mean confidence and accuracy of the bins that get drawn: those with MIN_BIN_ROWS or more."""
+    bin_conf, bin_acc, bin_count = reliability_bins(conf, correct, N_BINS)
+    keep = bin_count >= MIN_BIN_ROWS
+    return bin_conf[keep], bin_acc[keep]
+
+
 def plot_reliability(preds_by_name: dict[str, list[dict]], out_png, temperature_by_name=None):
     plt = _pyplot()
     fig, ax = plt.subplots(figsize=(5.2, 5.2))
@@ -154,14 +229,13 @@ def plot_reliability(preds_by_name: dict[str, list[dict]], out_png, temperature_
     for name, preds in preds_by_name.items():
         t = (temperature_by_name or {}).get(name, 1.0)
         _, _, _, conf, correct, _ = _arrays(preds, t)
-        bc, ba, bn = reliability_bins(conf, correct, N_BINS)
-        m = bn > 0
-        ax.plot(bc[m], ba[m], lw=1.6, ms=5, label=f"{name} (ECE {ece(conf, correct, N_BINS):.3f})",
-                **run_style(name))
+        x, y = reliability_points(conf, correct)
+        ax.plot(x, y, lw=1.6, ms=5, label=f"{name} (ECE {ece(conf, correct, N_BINS):.3f})", **run_style(name))
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.set_aspect("equal")
-    ax.set_xlabel(f"stated confidence (mean of each of {N_BINS} equal-width bins)")
+    ax.set_xlabel(f"stated confidence (mean of each of {N_BINS} equal-width bins;\n"
+                  f"bins with fewer than {MIN_BIN_ROWS} rows are not drawn)")
     ax.set_ylabel("fraction correct in the bin")
     _finish(fig, [ax], out_png)
     plt.close(fig)
@@ -185,19 +259,39 @@ def plot_coverage(preds_by_name: dict[str, list[dict]], out_png, temperature_by_
     plt.close(fig)
 
 
-def plot_curves(evals_by_name: dict[str, list[dict]], out_png):
+def curve_points(rows: list[dict], key: str, offset: int = 0) -> tuple[list, list]:
+    """x (eval step plus the run's offset) and y of the eval rows of a train log that carry key.
+    Logs older than the ECE column have no eval_ece."""
+    have = [r for r in rows if "eval_step" in r and key in r]
+    return [r["eval_step"] + offset for r in have], [r[key] for r in have]
+
+
+def stopped_step(rows: list[dict]):
+    """The optimizer step at which the stop rule ended the run, or None if it ran to the end."""
+    for r in rows:
+        if r.get("stopped"):
+            return r.get("at_step")
+    return None
+
+
+def plot_curves(logs_by_name: dict[str, list[dict]], out_png, offsets: dict[str, int] | None = None):
+    """Takes whole train logs. A run drawn with an offset starts at its warmup's final step. The
+    last point of a run ended by the stop rule gets a black x and the word stopped."""
     plt = _pyplot()
+    offsets = offsets or {}
     fig, (top, bottom) = plt.subplots(2, 1, figsize=(6.4, 6.4), sharex=True)
-    for name, rows in evals_by_name.items():
-        steps = [r["eval_step"] for r in rows]
+    for name, rows in logs_by_name.items():
         style = run_style(name)
-        top.plot(steps, [r["eval_acc"] for r in rows], lw=1.6, ms=5, label=name, **style)
-        with_ece = [r for r in rows if "eval_ece" in r]  # logs older than the ECE column have none
-        bottom.plot([r["eval_step"] for r in with_ece], [r["eval_ece"] for r in with_ece], lw=1.6, ms=5,
-                    label=name, **style)
+        for ax, key in ((top, "eval_acc"), (bottom, "eval_ece")):
+            x, y = curve_points(rows, key, offsets.get(name, 0))
+            ax.plot(x, y, lw=1.6, ms=5, label=name, **style)
+            if x and stopped_step(rows) is not None:
+                ax.plot(x[-1:], y[-1:], ls="none", marker="x", ms=11, mew=2.2, color="black", zorder=5)
+                ax.annotate("stopped", (x[-1], y[-1]), xytext=(6, 6), textcoords="offset points", fontsize=8)
     top.set_ylabel("held-out accuracy")
     bottom.set_ylabel(f"held-out ECE ({N_BINS} bins)")
-    bottom.set_xlabel("optimizer step")
+    bottom.set_xlabel("optimizer step, counted from the start of the warmup" if any(offsets.values())
+                      else "optimizer step")
     bottom.set_ylim(bottom=0)
     _finish(fig, [top, bottom], out_png, legend_ax=top)
     plt.close(fig)
@@ -205,7 +299,7 @@ def plot_curves(evals_by_name: dict[str, list[dict]], out_png):
 
 # ---------- known-posterior probe ----------
 
-PROBE_IDEAL = {"dept_single": {"acc": 1.0, "mean_p_cued": 1.0},
+PROBE_IDEAL = {"dept_single": {"acc": 1.0, "mean_p_cued": 1.0, "mean_max_p": 1.0},
                "dept_double": {"acc": 0.5, "mean_max_p": 0.5, "mean_mass_on_cued": 1.0,
                                "mean_abs_dev_first_from_half": 0.0},
                "escalate": {"acc": 0.9, "mean_conf": 0.9, "mean_p_implied": 0.9}}
@@ -272,7 +366,8 @@ def probe_report(rows: list[dict]) -> dict:
 
     return {
         "dept_single": {"n": len(single), "acc": acc(single),
-                        "mean_p_cued": _mean(r["probs"][r["cued"][0]] for r in single)},
+                        "mean_p_cued": _mean(r["probs"][r["cued"][0]] for r in single),
+                        "mean_max_p": _mean(max(r["probs"]) for r in single)},
         "dept_double": {"n": len(double), "acc": acc(double),
                         "mean_max_p": _mean(max(r["probs"]) for r in double),
                         "mean_mass_on_cued": _mean(r["probs"][r["cued"][0]] + r["probs"][r["cued"][1]]
@@ -292,7 +387,8 @@ def probe_tables(reports: dict[str, dict]) -> str:
     """Three markdown tables, one per probe group, with the ideal values in the header row."""
     specs = [
         ("Department question, one cued department (true posterior 1.0 on the cued department)", "dept_single",
-         [("acc", "accuracy (ideal 1.0)"), ("mean_p_cued", "mean p(cued department) (ideal 1.0)")]),
+         [("acc", "accuracy (ideal 1.0)"), ("mean_p_cued", "mean p(cued department) (ideal 1.0)"),
+          ("mean_max_p", "mean max probability (ideal 1.0)")]),
         ("Department question, two cued departments (true posterior 0.5 on each)", "dept_double",
          [("acc", "accuracy (ideal 0.5)"), ("mean_max_p", "mean max probability (ideal 0.5)"),
           ("mean_mass_on_cued", "mean mass on the two cued (ideal 1.0)"),
@@ -307,18 +403,12 @@ def probe_tables(reports: dict[str, dict]) -> str:
                   "|---" * (2 + len(cols)) + "|"]
         for name, report in reports.items():
             g = report[group]
-            lines.append(f"| {name} | {g['n']} | " + " | ".join(_fmt(g[key]) for key, _ in cols) + " |")
+            lines.append(f"| {name} | {g['n']} | " + " | ".join(_fmt(g.get(key)) for key, _ in cols) + " |")
         lines.append("")
     return "\n".join(lines)
 
 
 # ---------- commands ----------
-
-def _write_preds(path, preds: list[dict]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        for p in preds:
-            f.write(json.dumps(p) + "\n")
-
 
 def cmd_run(args):
     from rlcd.policies import load_policy
@@ -329,16 +419,17 @@ def cmd_run(args):
     preds = predict(policy, qs, args.max_len, args.batch_size, args.device)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    _write_preds(out / "preds.jsonl", preds)
+    write_rows(out / "preds.jsonl", preds)
     summary = summarize(preds, args.temperature)
     summary["meta"] = {"model": str(args.model), "split": str(args.split), "n": len(preds),
                        "temperature": args.temperature, "max_len": args.max_len, "n_bins": N_BINS,
-                       "note": "brier is a loss, lower is better; ci is a 95 percent bootstrap interval"}
+                       "note": "brier is a loss, lower is better; ci is a 95 percent bootstrap interval",
+                       "ece_note": ECE_NOTE}
     (out / "metrics.json").write_text(to_json(summary) + "\n")
     name = args.name or Path(args.model).name
     plot_reliability({name: preds}, out / "reliability.png", {name: args.temperature})
     plot_coverage({name: preds}, out / "coverage.png", {name: args.temperature})
-    print(to_json(summary["overall"]))
+    print(overall_text(summary["overall"]))
 
 
 def cmd_probe(args):
@@ -353,7 +444,7 @@ def cmd_probe(args):
     report = probe_report(rows)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    _write_preds(out / "probe_rows.jsonl", rows)
+    write_rows(out / "probe_rows.jsonl", rows)
     (out / "probe.json").write_text(to_json({
         "model": str(args.model), "n_tickets": args.n_tickets, "seed": args.seed,
         "questions_dropped_for_train_overlap": dropped, "ideal": PROBE_IDEAL, "report": report}) + "\n")
@@ -371,18 +462,85 @@ def _named_paths(items: list[str]) -> dict[str, Path]:
     return out
 
 
+def _read_meta(run_dir: Path) -> dict:
+    path = Path(run_dir) / "meta.json"
+    return json.loads(path.read_text()) if path.is_file() else {}
+
+
+def _init_dir(run_dir: Path, init) -> Path | None:
+    """The run directory a meta.json's init points at, if it still has a meta.json. init is
+    recorded relative to the directory training was launched from, so the sibling of run_dir
+    with the same name is tried as well."""
+    if not init:
+        return None
+    for candidate in (Path(init), Path(run_dir).parent / Path(init).name):
+        if (candidate / "meta.json").is_file() and candidate.resolve() != Path(run_dir).resolve():
+            return candidate
+    return None
+
+
+def training_label(run_dir: Path, depth: int = 0) -> str:
+    """What produced a checkpoint, read from meta.json: "500 SFT" for a supervised run,
+    "100 SFT + 500 RL" for an RL run (one with an arm) started from a run directory, with
+    "(stopped)" when the stop rule ended it and "(unfinished)" for a periodic checkpoint of a run
+    that never reached its end. "n/a" for hub ids and anything without a step count."""
+    meta = _read_meta(run_dir)
+    if meta.get("steps") is None:
+        return "n/a"
+    label = f"{meta['steps']} {'RL' if meta.get('arm') else 'SFT'}"
+    if meta.get("stopped"):
+        label += " (stopped)"
+    elif meta.get("in_progress"):
+        label += " (unfinished)"
+    init = _init_dir(run_dir, meta.get("init")) if depth < 4 else None
+    before = training_label(init, depth + 1) if init is not None else "n/a"
+    return label if before == "n/a" else f"{before} + {label}"
+
+
 def _run_meta(eval_dir: Path) -> dict:
-    """steps and stopped from the run's meta.json when the eval dir sits inside a run dir."""
-    meta_path = eval_dir.parent / "meta.json"
-    if not meta_path.is_file():
-        return {"steps": None, "stopped": ""}
-    meta = json.loads(meta_path.read_text())
-    return {"steps": meta.get("steps"), "stopped": meta.get("stopped") or ""}
+    """steps, stopped, and the training label from the run's meta.json when the eval dir sits
+    inside a run dir."""
+    meta = _read_meta(eval_dir.parent)
+    return {"steps": meta.get("steps"), "stopped": meta.get("stopped") or "",
+            "training": training_label(eval_dir.parent)}
 
 
 def _with_ci(m: dict, key: str) -> str:
     lo, hi = m["ci"][key]
     return f"{m[key]:.3f} [{lo:.3f}, {hi:.3f}]"
+
+
+def _parse_pairs(items: list[str], ids: dict[str, list]) -> list[tuple[str, str]]:
+    """a:b pairs of run names. Refuses unknown names and runs scored on different rows, before
+    anything is written: a paired difference over unmatched rows would be meaningless."""
+    pairs = []
+    for item in items:
+        a, sep, b = item.partition(":")
+        if not sep or not a or not b:
+            raise SystemExit(f"expected a:b in --pairs, got {item!r}")
+        for name in (a, b):
+            if name not in ids:
+                raise SystemExit(f"--pairs names {name!r}, which is not one of the --runs: {sorted(ids)}")
+        if ids[a] != ids[b]:
+            raise SystemExit(f"cannot pair {a} with {b}: they were not evaluated on the same rows in the "
+                             f"same order ({len(ids[a])} and {len(ids[b])} rows)")
+        pairs.append((a, b))
+    return pairs
+
+
+def paired_table(paired: dict[str, dict]) -> str:
+    def cell(d):
+        return f"{d['diff']:+.3f} [{d['lo']:+.3f}, {d['hi']:+.3f}]"
+
+    lines = ["| pair | acc difference [95% CI] | Brier loss difference, lower is better [95% CI] "
+             "| ECE difference [95% CI] |", "|---" * 4 + "|"]
+    for key, block in paired.items():
+        a, b = key.split(":", 1)
+        lines.append(f"| {a} minus {b} | {cell(block['acc'])} | {cell(block['brier'])} | {cell(block['ece'])} |")
+    lines += ["", "Each difference is the first run minus the second on the same rows. Intervals are 95 percent "
+              "percentile intervals of a paired bootstrap (1000 resamples, seed 0; every resample uses the same "
+              "rows for both runs). A difference whose interval excludes 0 is resolved by this test split."]
+    return "\n".join(lines) + "\n"
 
 
 def cmd_compare(args):
@@ -392,25 +550,30 @@ def cmd_compare(args):
     out.mkdir(parents=True, exist_ok=True)
 
     ids = {name: [p["id"] for p in preds] for name, preds in preds_by_name.items()}
+    pairs = _parse_pairs(args.pairs or [], ids)
     first = next(iter(ids))
     for name in ids:
         if ids[name] != ids[first]:
             print(f"WARNING: {name} and {first} were not evaluated on the same rows", file=sys.stderr)
 
     summaries = {name: summarize(preds) for name, preds in preds_by_name.items()}
-    rows = ["| run | steps | n | acc [95% CI] | Brier loss, lower is better [95% CI] | ECE [95% CI] | mean conf "
-            "| conf minus acc | NOTA recall | NOTA false alarm |", "|---" * 10 + "|"]
+    rows = ["| run | training | n | acc [95% CI] | Brier loss, lower is better [95% CI] | ECE [95% CI] | ECE bias "
+            "| mean conf | conf minus acc | NOTA recall | NOTA false alarm |", "|---" * 11 + "|"]
     table = {}
     for name, summary in summaries.items():
         m = summary["overall"]
         meta = _run_meta(runs[name])
-        steps = "n/a" if meta["steps"] is None else str(meta["steps"]) + (" (stopped)" if meta["stopped"] else "")
         table[name] = {**m, **meta, "by_source": summary["by_source"], "by_primitive": summary["by_primitive"]}
-        rows.append(f"| {name} | {steps} | {m['n']} | {_with_ci(m, 'acc')} | {_with_ci(m, 'brier')} "
-                    f"| {_with_ci(m, 'ece')} | {m['mean_conf']:.3f} | {m['conf_minus_acc']:+.3f} "
-                    f"| {_fmt(m['nota_rate'])} | {_fmt(m['nota_false_alarm'])} |")
+        rows.append(f"| {name} | {meta['training']} | {m['n']} | {_with_ci(m, 'acc')} | {_with_ci(m, 'brier')} "
+                    f"| {_with_ci(m, 'ece')} | {m['ece_bias']:+.3f} | {m['mean_conf']:.3f} "
+                    f"| {m['conf_minus_acc']:+.3f} | {_fmt(m['nota_rate'])} | {_fmt(m['nota_false_alarm'])} |")
+    rows += ["", ECE_NOTE]
     (out / "table.md").write_text("\n".join(rows) + "\n")
-    (out / "metrics.json").write_text(to_json(table) + "\n")
+    result = {"runs": table, "ece_note": ECE_NOTE}
+    if pairs:
+        result["paired"] = {f"{a}:{b}": paired_differences(preds_by_name[a], preds_by_name[b]) for a, b in pairs}
+        (out / "paired.md").write_text(paired_table(result["paired"]))
+    (out / "metrics.json").write_text(to_json(result) + "\n")
 
     sources = sorted({s for summary in summaries.values() for s in summary["by_source"]})
     lines = []
@@ -431,24 +594,36 @@ def cmd_compare(args):
         (out / "probe.md").write_text(probe_tables(probes))
     print("\n".join(rows))
     print()
+    if pairs:
+        print(paired_table(result["paired"]))
     print("\n".join(lines))
     if probes:
         print(probe_tables(probes))
 
 
 def cmd_curves(args):
-    evals = {}
+    logs = {}
     for name, path in _named_paths(args.runs).items():
         with open(path / "train_log.jsonl", encoding="utf-8") as f:
-            rows = [json.loads(line) for line in f if line.strip()]
-        evals[name] = [r for r in rows if "eval_step" in r]
-        if not evals[name]:
+            logs[name] = [json.loads(line) for line in f if line.strip()]
+        if not curve_points(logs[name], "eval_acc")[0]:
             raise SystemExit(f"{path / 'train_log.jsonl'} has no eval rows")
-        if not any("eval_ece" in r for r in evals[name]):
+        if not curve_points(logs[name], "eval_ece")[0]:
             print(f"note: {name} logged no eval_ece, so it appears in the accuracy panel only")
+    offsets = {}
+    for item in args.offset or []:
+        name, sep, steps = item.partition("=")
+        if not sep or not steps.lstrip("-").isdigit():
+            raise SystemExit(f"expected name=steps in --offset, got {item!r}")
+        if name not in logs:
+            raise SystemExit(f"--offset names {name!r}, which is not one of the --runs: {sorted(logs)}")
+        offsets[name] = int(steps)
+    for name, rows in logs.items():
+        if stopped_step(rows) is not None:
+            print(f"note: {name} was stopped at step {stopped_step(rows)}; its last point is marked")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    plot_curves(evals, out / args.name)
+    plot_curves(logs, out / args.name, offsets)
     print(f"wrote {out / args.name}")
 
 
@@ -482,12 +657,17 @@ def main(argv=None):
     c = sub.add_parser("compare", help="tables and overlaid plots across eval directories")
     c.add_argument("--runs", nargs="+", required=True, help="name=path/to/eval-dir")
     c.add_argument("--out", required=True)
+    c.add_argument("--pairs", nargs="*", default=[], metavar="A:B",
+                   help="run-name pairs; writes paired.md with A minus B and paired bootstrap intervals "
+                        "for accuracy, ECE, and Brier loss. Both runs must cover the same rows.")
     c.set_defaults(fn=cmd_compare)
 
     v = sub.add_parser("curves", help="held-out accuracy and ECE against optimizer step")
     v.add_argument("--runs", nargs="+", required=True, help="name=path/to/run-dir")
     v.add_argument("--out", required=True)
     v.add_argument("--name", default="curves.png", help="file name of the figure inside --out")
+    v.add_argument("--offset", nargs="*", default=[], metavar="NAME=STEPS",
+                   help="draw a run starting at this step, e.g. an RL run at its warmup's final step")
     v.set_defaults(fn=cmd_curves)
 
     args = ap.parse_args(argv)

@@ -162,3 +162,50 @@ def test_bootstrap_ci_resamples_rows_jointly():
     # The statistic is zero only if both arrays are indexed with the same resampled rows.
     lo, hi = bootstrap_ci(lambda x, y: float(np.abs(x - y).max()), (a, a.copy()), n_boot=50)
     assert lo == hi == 0.0
+
+
+def test_bootstrap_stats_feeds_bootstrap_ci():
+    from rlcd.metrics import bootstrap_ci, bootstrap_stats
+    x = np.random.default_rng(2).normal(size=300)
+    stats = bootstrap_stats(lambda a: float(a.mean()), (x,), n_boot=200, seed=3)
+    assert stats.shape == (200,)
+    lo, hi = np.percentile(stats, [2.5, 97.5])
+    assert (float(lo), float(hi)) == bootstrap_ci(lambda a: float(a.mean()), (x,), n_boot=200, seed=3)
+
+
+def test_paired_bootstrap_diff_is_exactly_zero_for_identical_runs():
+    from rlcd.metrics import ece, paired_bootstrap_diff
+    rng = np.random.default_rng(0)
+    conf = rng.uniform(0.3, 1.0, size=500)
+    correct = (rng.uniform(size=500) < conf).astype(float)
+    assert paired_bootstrap_diff(lambda c: float(c.mean()), (correct,), (correct.copy(),)) == (0.0, 0.0, 0.0)
+    assert paired_bootstrap_diff(lambda f, c: ece(f, c, 15), (conf, correct),
+                                 (conf.copy(), correct.copy())) == (0.0, 0.0, 0.0)
+
+
+def test_paired_bootstrap_diff_sign_and_pairing():
+    from rlcd.metrics import bootstrap_ci, paired_bootstrap_diff
+    rng = np.random.default_rng(1)
+    b = (rng.uniform(size=1000) < 0.5).astype(float)
+    a = b.copy()
+    wrong = np.flatnonzero(b == 0)
+    a[wrong[:50]] = 1.0          # a is right on every row b is right on, plus 50 more
+    mean = lambda c: float(c.mean())  # noqa: E731
+    diff, lo, hi = paired_bootstrap_diff(mean, (a,), (b,))
+    assert abs(diff - 0.05) < 1e-12
+    assert 0.0 < lo < diff < hi
+    # b minus a flips the sign of everything.
+    rdiff, rlo, rhi = paired_bootstrap_diff(mean, (b,), (a,))
+    assert abs(rdiff + 0.05) < 1e-12 and rlo < rdiff < rhi < 0.0
+    # Pairing is the point: the interval is far tighter than the unpaired intervals would allow.
+    alo, ahi = bootstrap_ci(mean, (a,))
+    assert hi - lo < 0.5 * (ahi - alo)
+    assert (diff, lo, hi) == paired_bootstrap_diff(mean, (a,), (b,))
+
+
+def test_paired_bootstrap_diff_rejects_unequal_lengths():
+    import pytest
+
+    from rlcd.metrics import paired_bootstrap_diff
+    with pytest.raises(ValueError):
+        paired_bootstrap_diff(lambda c: float(c.mean()), (np.ones(5),), (np.ones(6),))

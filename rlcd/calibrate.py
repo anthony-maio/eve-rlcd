@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from rlcd.eval import load_preds, summarize, to_json
+from rlcd.eval import load_preds, overall_text, summarize, to_json
 from rlcd.schema import NEG
 
 
@@ -51,7 +51,15 @@ def main(argv=None):
                              "temperature_fitted": summarize(held_out, result["overall"])["overall"]}
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(to_json(result) + "\n")
-    print(to_json(result))
+    print(f"fitted on {args.preds} ({len(preds)} rows)")
+    for key, value in result.items():
+        if isinstance(value, float):
+            print(f"temperature, {key:<10} {value:.4f}")
+    if args.apply_to:
+        for title, key in (("temperature 1", "temperature_1"),
+                           (f"fitted overall temperature {result['overall']:.4f}", "temperature_fitted")):
+            print(f"\n{args.apply_to} at {title}:")
+            print(overall_text(result["applied"][key]))
 
 
 if __name__ == "__main__":
