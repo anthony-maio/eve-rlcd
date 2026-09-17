@@ -58,12 +58,13 @@ class Policy(Protocol):
 
 def remote_code_kwargs(path_or_id: str, base: str | None = None) -> dict:
     """from_pretrained kwargs that enable custom code, only for a pinned repo. A local checkpoint
-    of a pinned base carries its own copy of the reviewed files, so it gets no revision."""
+    of a pinned base keeps an auto_map that points back at the hub repo, so its code is pinned
+    with code_revision; the weights come from the directory."""
     path_or_id = os.fspath(path_or_id)
     if path_or_id in PINNED_REMOTE_CODE:
         return {"trust_remote_code": True, "revision": PINNED_REMOTE_CODE[path_or_id]}
     if base in PINNED_REMOTE_CODE and os.path.isdir(path_or_id):
-        return {"trust_remote_code": True}
+        return {"trust_remote_code": True, "code_revision": PINNED_REMOTE_CODE[base]}
     return {}
 
 

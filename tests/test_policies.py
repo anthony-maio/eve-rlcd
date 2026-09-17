@@ -390,7 +390,7 @@ def test_hf_mlm_truncation_keeps_the_mask_token(mask_tok):
     assert ids[0, pos[0]] == mask_tok.mask_token_id
 
 
-def test_remote_code_is_only_trusted_for_reviewed_and_pinned_revisions():
+def test_remote_code_is_only_trusted_for_reviewed_and_pinned_revisions(tmp_path):
     from rlcd.policies import PINNED_REMOTE_CODE, remote_code_kwargs
     assert set(PINNED_REMOTE_CODE) <= {"LiquidAI/LFM2.5-Encoder-350M"}
     for revision in PINNED_REMOTE_CODE.values():
@@ -399,6 +399,10 @@ def test_remote_code_is_only_trusted_for_reviewed_and_pinned_revisions():
     assert remote_code_kwargs("Qwen/Qwen3-0.6B-Base") == {}
     for repo, revision in PINNED_REMOTE_CODE.items():
         assert remote_code_kwargs(repo) == {"trust_remote_code": True, "revision": revision}
+        # A local fine-tune of a pinned base still resolves its code at the pinned commit.
+        assert remote_code_kwargs(str(tmp_path), base=repo) == {"trust_remote_code": True,
+                                                                "code_revision": revision}
+    assert remote_code_kwargs(str(tmp_path), base="someone/unknown-custom-encoder") == {}
 
 
 # ---------- repos written by transformers 5 ----------
