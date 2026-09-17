@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Base model is `anthonym21/Eve-2-MoE-IT-272M`. Its code is vendored under `rlcd/eve/` (MIT, the author's own). Never load it with `trust_remote_code`; always use the vendored class so the policy adapter can walk `model.transformer.h`.
-- Every Eve config is built or loaded through `rlcd.compat.eve_config(**kw)` or `rlcd.compat.load_eve_config(path_or_id)`. Never call `eve_config(...)` or `EveConfig.from_pretrained` directly, and never call `EveMoEForCausalLM.from_pretrained` without `config=load_eve_config(...)`. Reason: EveConfig's MoE routing field `top_k` collides with a legacy generation default in transformers 4.x, which silently overwrites it with 50.
+- Every Eve config is built or loaded through `rlcd.compat.eve_config(**kw)` or `rlcd.compat.load_eve_config(path_or_id)`. Never call the raw `EveConfig` constructor or `EveConfig.from_pretrained` directly, and never call `EveMoEForCausalLM.from_pretrained` without `config=load_eve_config(...)`. Reason: EveConfig's MoE routing field `top_k` collides with a legacy generation default in transformers 4.x, which silently overwrites it with 50.
 - The HF wrapper does not inherit `GenerationMixin` on transformers >= 4.50, so `model.generate()` is unavailable. Nothing in this project needs it; use an explicit greedy loop where text generation is wanted for a sanity check.
 - The ASCII rule exempts the vendored files under `rlcd/eve/`, which stay byte-identical to the hub.
 - Prompt format is exactly the one in the spec, ending in `Assistant: The answer is`. The decision token is the next token, one of `" A"` .. `" Z"`.
