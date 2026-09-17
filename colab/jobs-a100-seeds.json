@@ -1,0 +1,37 @@
+[
+  {
+    "name": "q-warmup",
+    "eval": true,
+    "cmd": "python -m rlcd.train_sft --init Qwen/Qwen3-0.6B-Base --backend hf-decoder --data data/train.jsonl --start 0 --n 6400 --epochs 1 --micro 8 --accum 8 --lr 2e-5 --out runs/q-warmup --eval-data data/val.jsonl --eval-every 25 --eval-n 2000"
+  },
+  {
+    "name": "q-rlcd-s1",
+    "eval": true,
+    "cmd": "python -m rlcd.train_rl --init runs/q-warmup --backend hf-decoder --start 32000 --epochs 2 --micro 8 --accum 16 --group 4 --kl 0 --eval-data data/val.jsonl --eval-every 50 --eval-n 2000 --save-every 100 --arm rlcd --lr 2e-5 --seed 1 --out runs/q-rlcd-s1"
+  },
+  {
+    "name": "q-rlvr-lowlr-s1",
+    "eval": true,
+    "cmd": "python -m rlcd.train_rl --init runs/q-warmup --backend hf-decoder --start 32000 --epochs 2 --micro 8 --accum 16 --group 4 --kl 0 --eval-data data/val.jsonl --eval-every 50 --eval-n 2000 --save-every 100 --arm rlvr --lr 4e-6 --seed 1 --out runs/q-rlvr-lowlr-s1"
+  },
+  {
+    "name": "q-oracle-s1",
+    "eval": true,
+    "cmd": "python -m rlcd.train_rl --init runs/q-warmup --backend hf-decoder --start 32000 --epochs 2 --micro 8 --accum 16 --group 4 --kl 0 --eval-data data/val.jsonl --eval-every 50 --eval-n 2000 --save-every 100 --arm oracle --lr 2e-5 --seed 1 --out runs/q-oracle-s1"
+  },
+  {
+    "name": "q-rlcd-s2",
+    "eval": true,
+    "cmd": "python -m rlcd.train_rl --init runs/q-warmup --backend hf-decoder --start 32000 --epochs 2 --micro 8 --accum 16 --group 4 --kl 0 --eval-data data/val.jsonl --eval-every 50 --eval-n 2000 --save-every 100 --arm rlcd --lr 2e-5 --seed 2 --out runs/q-rlcd-s2"
+  },
+  {
+    "name": "q-rlvr-lowlr-s2",
+    "eval": true,
+    "cmd": "python -m rlcd.train_rl --init runs/q-warmup --backend hf-decoder --start 32000 --epochs 2 --micro 8 --accum 16 --group 4 --kl 0 --eval-data data/val.jsonl --eval-every 50 --eval-n 2000 --save-every 100 --arm rlvr --lr 4e-6 --seed 2 --out runs/q-rlvr-lowlr-s2"
+  },
+  {
+    "name": "q-oracle-s2",
+    "eval": true,
+    "cmd": "python -m rlcd.train_rl --init runs/q-warmup --backend hf-decoder --start 32000 --epochs 2 --micro 8 --accum 16 --group 4 --kl 0 --eval-data data/val.jsonl --eval-every 50 --eval-n 2000 --save-every 100 --arm oracle --lr 2e-5 --seed 2 --out runs/q-oracle-s2"
+  }
+]
