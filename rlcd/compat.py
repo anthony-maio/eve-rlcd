@@ -1,8 +1,9 @@
 """Workarounds for incompatibilities between the vendored Eve code and current transformers.
 
-EveConfig names its MoE routing field `top_k`. transformers 4.x PretrainedConfig.__init__
-also sets a legacy generation default called `top_k` (50) and overwrites it. Always build
-and load Eve configs through these helpers so routing uses the real value."""
+EveConfig names its MoE routing field `top_k`. EveConfig.__init__ sets `self.top_k` first,
+then PretrainedConfig.__init__ (transformers 4.x) resets `self.top_k` to its legacy
+generation default 50, silently clobbering the routing value. Always build and load Eve
+configs through these helpers so routing uses the real value."""
 from __future__ import annotations
 
 import json
@@ -23,9 +24,10 @@ def eve_config(**kwargs) -> EveConfig:
     return config
 
 
-def load_eve_config(path_or_id: str) -> EveConfig:
+def load_eve_config(path_or_id: str | os.PathLike) -> EveConfig:
     """Load an EveConfig from a local directory or hub id with the routing top_k restored
     from the raw config.json."""
+    path_or_id = os.fspath(path_or_id)
     if os.path.isdir(path_or_id):
         config_file = os.path.join(path_or_id, "config.json")
     else:

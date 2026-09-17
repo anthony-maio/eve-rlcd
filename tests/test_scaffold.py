@@ -41,3 +41,8 @@ def test_load_eve_config_restores_top_k_from_disk(tmp_path):
         raw = json.load(f)
     assert raw["top_k"] == 1
     assert load_eve_config(str(tmp_path)).top_k == 1
+
+
+def test_load_eve_config_accepts_pathlib_path(tmp_path):
+    tiny_config().save_pretrained(tmp_path)
+    assert load_eve_config(tmp_path).top_k == 1

@@ -32,6 +32,7 @@ markers = [
     "gpu: needs a CUDA device",
 ]
 addopts = "-m 'not network and not gpu'"
+filterwarnings = ["ignore:Some non-default generation parameters:UserWarning"]
 
 [build-system]
 requires = ["hatchling"]
