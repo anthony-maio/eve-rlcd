@@ -23,28 +23,39 @@ def subset_choices(all_choices: list[str], truth: str, n: int, rng: random.Rando
 
 def inject_nota(q: Question, rng: random.Random, p_remove: float = 0.15, p_add: float = 0.35) -> Question:
     """With p_remove: drop the true choice and make NOTA correct.
-    With p_add: append NOTA as a distractor. Otherwise unchanged. Never for noul."""
+    With p_add: drop one random distractor and append NOTA as a distractor.
+    Otherwise unchanged. Never for noul.
+
+    Both branches remove exactly one original option, so the option count never changes and
+    cannot reveal whether NOTA is the answer. Only the context can."""
     if q.primitive == "noul" or NOTA in q.choices:
         return q
     r = rng.random()
     if r < p_remove:
-        choices = [c for i, c in enumerate(q.choices) if i != q.answer]
-        if len(choices) >= MAX_CHOICES:
-            choices = choices[: MAX_CHOICES - 1]
-        choices.append(NOTA)
-        return Question(q.primitive, q.context, q.question, choices, q.ordered,
-                        len(choices) - 1, q.source, q.id)
-    if r < p_remove + p_add:
-        choices = list(q.choices)
-        answer = q.answer
-        if len(choices) >= MAX_CHOICES:
-            drop = rng.choice([i for i in range(len(choices)) if i != answer])
-            choices.pop(drop)
-            if drop < answer:
-                answer -= 1
-        choices.append(NOTA)
-        return Question(q.primitive, q.context, q.question, choices, q.ordered, answer, q.source, q.id)
-    return q
+        drop = q.answer
+    elif r < p_remove + p_add:
+        drop = rng.choice([i for i in range(q.k) if i != q.answer])
+    else:
+        return q
+    choices = [c for i, c in enumerate(q.choices) if i != drop] + [NOTA]
+    if drop == q.answer:
+        answer = len(choices) - 1
+    else:
+        answer = q.answer - (1 if drop < q.answer else 0)
+    return Question(q.primitive, q.context, q.question, choices, q.ordered, answer, q.source, q.id)
+
+
+def shuffle_choices(q: Question, rng: random.Random) -> Question:
+    """Permute the options of an unordered choice question so the answer position carries no
+    signal. NOTA, when present, stays last. score and noul keep their fixed order."""
+    if q.primitive != "choice" or q.ordered:
+        return q
+    order = [i for i, c in enumerate(q.choices) if c != NOTA]
+    rng.shuffle(order)
+    order += [i for i, c in enumerate(q.choices) if c == NOTA]
+    choices = [q.choices[i] for i in order]
+    answer = None if q.answer is None else order.index(q.answer)
+    return Question(q.primitive, q.context, q.question, choices, q.ordered, answer, q.source, q.id)
 
 
 def clean_labels(names: list[str], source: str) -> list[str]:
@@ -66,12 +77,29 @@ def drop_empty_contexts(qs: list[Question]) -> tuple[list[Question], int]:
 
 
 def split_source(qs: list[Question], per_source: int, n_val: int, n_test: int, rng: random.Random):
-    qs = list(qs)
-    rng.shuffle(qs)
-    test = qs[:n_test]
-    val = qs[n_test:n_test + n_val]
-    train = qs[n_test + n_val:n_test + n_val + per_source]
-    return train, val, test
+    """Split so that all questions sharing a context land in the same split.
+
+    Groups are shuffled, then test is filled until it holds at least n_test questions, then val,
+    then train up to per_source. The overshoot of test and val (the tail of their last group) is
+    dropped, not moved, so no context ever straddles two splits."""
+    groups: dict[str, list[Question]] = {}
+    for q in qs:
+        groups.setdefault(q.context, []).append(q)
+    order = list(groups.values())
+    rng.shuffle(order)
+    train: list[Question] = []
+    val: list[Question] = []
+    test: list[Question] = []
+    for group in order:
+        if len(test) < n_test:
+            test += group
+        elif len(val) < n_val:
+            val += group
+        elif len(train) < per_source:
+            train += group
+        else:
+            break
+    return train[:per_source], val[:n_val], test[:n_test]
 
 
 # ---------- synthetic triage ----------
@@ -141,7 +169,7 @@ def load_bitext(rng: random.Random) -> list[Question]:
     intents = list(clean.values())
     out = []
     for i, row in enumerate(ds):
-        choices, ans = subset_choices(intents, clean[row["intent"]], 25, rng)
+        choices, ans = subset_choices(intents, clean[row["intent"]], rng.randint(4, MAX_CHOICES), rng)
         out.append(Question("choice", row["instruction"], "What is the customer's intent?",
                             choices, False, ans, "bitext", f"bitext-{i}"))
     return out
@@ -155,7 +183,7 @@ def load_banking77(rng: random.Random) -> list[Question]:
     out = []
     for i, row in enumerate(ds):
         truth = names[row["label"]]
-        choices, ans = subset_choices(names, truth, 25, rng)
+        choices, ans = subset_choices(names, truth, rng.randint(4, MAX_CHOICES), rng)
         out.append(Question("choice", row["text"], "Which banking intent does the message express?",
                             choices, False, ans, "banking77", f"banking77-{i}"))
     return out
@@ -235,9 +263,9 @@ def build(out_dir: str, per_source: int = 8000, n_val: int = 1000, n_test: int =
     for name in sources or list(SOURCES):
         qs, skipped[name] = drop_empty_contexts(SOURCES[name](rng))
         tr, va, te = split_source(qs, per_source, n_val, n_test, rng)
-        tr = [inject_nota(q, rng) for q in tr]
-        va = [inject_nota(q, rng) for q in va]
-        te = [inject_nota(q, rng) for q in te]
+        tr = [shuffle_choices(inject_nota(q, rng), rng) for q in tr]
+        va = [shuffle_choices(inject_nota(q, rng), rng) for q in va]
+        te = [shuffle_choices(inject_nota(q, rng), rng) for q in te]
         train += tr
         val += va
         test += te
