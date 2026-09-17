@@ -31,17 +31,24 @@ class Question:
     def validate(self) -> "Question":
         if self.primitive not in PRIMITIVES:
             raise ValueError(f"unknown primitive {self.primitive!r}")
+        if not isinstance(self.choices, list) or not all(isinstance(c, str) for c in self.choices):
+            raise ValueError("choices must be a list of str")
         n = len(self.choices)
         if n < 2 or n > MAX_CHOICES:
             raise ValueError(f"need 2..{MAX_CHOICES} choices, got {n}")
-        if len(set(self.choices)) != n:
+        if any(not c.strip() or "\n" in c or "\r" in c for c in self.choices):
+            raise ValueError("choices must be non-empty single-line strings")
+        if len({c.strip() for c in self.choices}) != n:
             raise ValueError("duplicate choices")
         if self.primitive == "noul" and self.choices != ["true", "false"]:
             raise ValueError('noul choices must be exactly ["true", "false"]')
         if self.primitive == "score" and not self.ordered:
             raise ValueError("score questions must set ordered=True")
-        if self.answer is not None and not (0 <= self.answer < n):
-            raise ValueError(f"answer {self.answer} out of range for {n} choices")
+        if self.answer is not None:
+            if type(self.answer) is not int:
+                raise ValueError(f"answer must be an int or None, got {self.answer!r}")
+            if not (0 <= self.answer < n):
+                raise ValueError(f"answer {self.answer} out of range for {n} choices")
         return self
 
     def to_json(self) -> str:
@@ -80,12 +87,21 @@ def letter_token_ids(tokenizer) -> list[int]:
 
 
 def read_jsonl(path) -> list[Question]:
+    out: list[Question] = []
     with open(path, encoding="utf-8") as f:
-        return [Question.from_json(line) for line in f if line.strip()]
+        for i, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            try:
+                out.append(Question.from_json(line))
+            except (ValueError, TypeError) as e:
+                raise ValueError(f"{path}:{i}: {e}") from e
+    return out
 
 
 def write_jsonl(path, questions: list[Question]) -> None:
+    rows = [q.validate().to_json() for q in questions]
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        for q in questions:
-            f.write(q.validate().to_json() + "\n")
+        for row in rows:
+            f.write(row + "\n")
