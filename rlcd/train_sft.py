@@ -7,7 +7,8 @@ import time
 
 import torch
 
-from rlcd.loop import JsonlLogger, batch_indices, cosine_lr, save_checkpoint, slice_meta, window_size
+from rlcd.loop import (GradWindow, JsonlLogger, batch_indices, cosine_lr, plan_steps, save_checkpoint,
+                       slice_meta)
 from rlcd.policy import EVE_ID, decision_logits, load_eve, questions_to_batch
 from rlcd.quick_eval import evaluate, stride_sample
 from rlcd.rewards import supervised_loss
@@ -37,12 +38,15 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--eval-every", type=int, default=0)
     ap.add_argument("--eval-n", type=int, default=2000)
     ap.add_argument("--no-save", action="store_true", help="skip the checkpoint; the log is still written")
+    ap.add_argument("--overwrite", action="store_true", help="replace an existing train_log.jsonl in --out")
     return ap
 
 
 def main():
     args = build_parser().parse_args()
 
+    # Open the log first: it refuses to wipe a finished curve, and that should fail fast.
+    log = JsonlLogger(f"{args.out}/train_log.jsonl", overwrite=args.overwrite)
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
     qs = select_slice(read_jsonl(args.data), args.start, args.n)
@@ -59,34 +63,41 @@ def main():
     letters = letter_token_ids(tok)
     aux_coef = model.config.router_aux_loss_coef
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
-    # Accumulation windows run across epoch boundaries, so count micro-batches over the whole run.
-    n_micro = args.epochs * ((len(qs) + args.micro - 1) // args.micro)
-    total = (n_micro + args.accum - 1) // args.accum
+    total = plan_steps(len(qs), args.micro, args.accum, args.epochs)
     meta = vars(args) | slice_meta(qs, args.start)
-    log = JsonlLogger(f"{args.out}/train_log.jsonl")
     log.log(**slice_meta(qs, args.start), total_steps=total)
 
-    step, micro_index, t0 = 0, 0, time.time()
-    window = {"n": 0, "loss": 0.0, "aux": 0.0, "hits": 0.0, "conf": 0.0, "micro": 0}
+    step, last_logged, last_eval, t0 = 0, 0, 0, time.time()
+    grads = GradWindow()
+    sums = {"nll": 0.0, "aux": 0.0, "hits": 0.0, "conf": 0.0}
+    row: dict = {}
+
+    def run_eval() -> None:
+        nonlocal last_eval
+        log.log(eval_step=step, **evaluate(model, tok, letters, eval_qs, args.max_len), sec=time.time() - t0)
+        last_eval = step
 
     def optimizer_step(epoch: int) -> None:
-        nonlocal step
+        nonlocal step, row, last_logged
+        n = grads.finish(model.parameters())
         for g in opt.param_groups:
             g["lr"] = cosine_lr(step + 1, total, args.lr, warmup=max(1, total // 20))
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
         opt.step()
         opt.zero_grad(set_to_none=True)
         step += 1
-        if step % 5 == 0 or step == total:
-            log.log(step=step, epoch=epoch, loss=window["loss"] / window["micro"],
-                    aux=window["aux"] / window["micro"], acc=window["hits"] / window["n"],
-                    mean_conf=window["conf"] / window["n"], lr=opt.param_groups[0]["lr"],
-                    sec=time.time() - t0)
-        for key in window:
-            window[key] = 0 if key in ("n", "micro") else 0.0
-        if eval_qs and (step % args.eval_every == 0 or step == total):
-            log.log(eval_step=step, **evaluate(model, tok, letters, eval_qs, args.max_len),
-                    sec=time.time() - t0)
+        # Means over the examples of the window. loss is the objective without the router aux
+        # term; for SFT that is the NLL.
+        row = dict(step=step, epoch=epoch, loss=sums["nll"] / n, nll=sums["nll"] / n, aux=sums["aux"] / n,
+                   acc=sums["hits"] / n, mean_conf=sums["conf"] / n, grad_norm=grad_norm,
+                   lr=opt.param_groups[0]["lr"], sec=time.time() - t0)
+        for key in sums:
+            sums[key] = 0.0
+        if step % 5 == 0:
+            log.log(**row)
+            last_logged = step
+        if eval_qs and step % args.eval_every == 0:
+            run_eval()
 
     for epoch in range(args.epochs):
         for idx in batch_indices(len(qs), args.micro, rng):
@@ -95,21 +106,23 @@ def main():
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 logits, aux = decision_logits(model, ids, last, letters, k)
             logp = torch.log_softmax(logits, -1)
-            loss = supervised_loss(logp, answers[idx]) + aux_coef * aux
-            (loss / window_size(micro_index, n_micro, args.accum)).backward()
-            micro_index += 1
+            nll = supervised_loss(logp, answers[idx])
+            grads.backward(nll + aux_coef * aux, len(idx))
             with torch.no_grad():
-                window["n"] += len(idx)
-                window["micro"] += 1
-                window["loss"] += loss.detach().item()
-                window["aux"] += aux.detach().item()
-                window["hits"] += (logp.argmax(-1).cpu() == answers[idx]).float().sum().item()
-                window["conf"] += logp.exp().max(-1).values.sum().item()
-            if window["micro"] == args.accum:
+                sums["nll"] += nll.item() * len(idx)
+                sums["aux"] += aux.detach().item() * len(idx)
+                sums["hits"] += (logp.argmax(-1).cpu() == answers[idx]).float().sum().item()
+                sums["conf"] += logp.exp().max(-1).values.sum().item()
+            if grads.micro == args.accum:
                 optimizer_step(epoch)
-    if window["micro"]:
+    if grads.micro:
         # Trailing micro-batches that did not fill an accumulation window still get applied.
         optimizer_step(args.epochs - 1)
+    # The run always ends with a train row and an eval, whatever the step count turned out to be.
+    if row and last_logged != step:
+        log.log(**row)
+    if eval_qs and last_eval != step:
+        run_eval()
 
     if args.no_save:
         print("checkpoint skipped (--no-save)")

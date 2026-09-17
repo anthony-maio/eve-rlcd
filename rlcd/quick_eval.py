@@ -9,12 +9,13 @@ from rlcd.policy import decision_logits, questions_to_batch
 from rlcd.schema import Question
 
 
-def stride_sample(questions: list, n: int) -> list:
-    """Every (len // n)-th row, at most n of them. Eval files are sorted by source, so a head
-    slice would miss most sources. Returns all rows if there are n or fewer."""
-    if n <= 0 or len(questions) <= n:
-        return list(questions)
-    return questions[:: len(questions) // n][:n]
+def stride_sample(items: list, n: int) -> list:
+    """min(n, len) items spread evenly over the whole list. Eval files are sorted by source, so
+    a head slice (or a fixed integer stride followed by truncation) would miss sources."""
+    if n <= 0:
+        raise ValueError(f"n must be positive, got {n}")
+    m = min(n, len(items))
+    return [items[i * len(items) // m] for i in range(m)]
 
 
 def evaluate(model, tok, letters, questions: list[Question], max_len: int = 512, batch_size: int = 32,
@@ -27,14 +28,16 @@ def evaluate(model, tok, letters, questions: list[Question], max_len: int = 512,
     was_training = model.training
     model.eval()
     rows = []
-    with torch.no_grad():
-        for i in range(0, len(questions), batch_size):
-            batch = questions[i:i + batch_size]
-            ids, last, k = questions_to_batch(tok, batch, max_len, device)
-            with torch.autocast(device_type, dtype=torch.bfloat16, enabled=device_type == "cuda"):
-                logits, _ = decision_logits(model, ids, last, letters, k)
-            rows.append(torch.log_softmax(logits, -1).double().cpu().numpy())
-    model.train(was_training)
+    try:
+        with torch.no_grad():
+            for i in range(0, len(questions), batch_size):
+                batch = questions[i:i + batch_size]
+                ids, last, k = questions_to_batch(tok, batch, max_len, device)
+                with torch.autocast(device_type, dtype=torch.bfloat16, enabled=device_type == "cuda"):
+                    logits, _ = decision_logits(model, ids, last, letters, k)
+                rows.append(torch.log_softmax(logits, -1).double().cpu().numpy())
+    finally:
+        model.train(was_training)
 
     logp = np.concatenate(rows)
     p = np.exp(logp)

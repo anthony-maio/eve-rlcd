@@ -44,6 +44,17 @@ def test_rl_step_each_arm_produces_finite_loss_and_grads():
         assert grads and all(torch.isfinite(g).all() for g in grads)
         assert set(stats) >= STAT_KEYS
         assert all(isinstance(v, float) for v in stats.values())
+        assert ("nll" in stats) == (arm == "oracle")
+
+
+def test_logged_loss_excludes_the_aux_term():
+    model = tiny().train()
+    env = BanditEnv(torch.tensor([1, 0]))
+    loss, stats = rl_step(model, None, FakeTok(), list(range(100, 126)), _batch(), torch.tensor([0, 1]), env,
+                          arm="oracle", group=1, kl_coef=0.0, aux_coef=0.5, max_len=64, device="cpu")
+    assert stats["aux"] > 0.0
+    assert abs(stats["loss"] - stats["nll"]) < 1e-6
+    assert abs(loss.item() - (stats["loss"] + 0.5 * stats["aux"])) < 1e-5
 
 
 def test_bandit_arms_never_call_reveal(monkeypatch):
