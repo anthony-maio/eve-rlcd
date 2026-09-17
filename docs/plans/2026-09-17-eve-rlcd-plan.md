@@ -20,6 +20,9 @@
 - Any head computation on hidden states (decision logits, the amputated decision head) runs inside `torch.autocast(device_type=..., enabled=False)` in fp32. Autocast otherwise quantizes logits to bf16.
 - Memory: a training-like step at batch 32 x 149 tokens peaks near 8.3 GB. Activations scale with batch x tokens, so training defaults are micro-batch 8 with gradient accumulation. Check `torch.cuda.max_memory_allocated()` in smoke runs.
 - Log the router aux loss with `aux.detach().item()`, never `float(aux)` on a tensor that requires grad.
+- Data design as built (supersedes the Task 6 code block where they differ): `inject_nota` preserves the option count in both NOTA branches (remove the truth, or remove one random distractor, then append NOTA), so the count never reveals whether NOTA is correct; unordered `choice` questions have their options shuffled per example with NOTA kept last; Bitext and Banking77 use a random subset size in 4..26 per row; `split_source` keeps all questions that share a context in the same split. Banking77 loads from `legacy-datasets/banking77` (the PolyAI repo is script-only).
+- `rlcd.metrics` also provides `nota_false_alarm(pred, answers, nota_index)`. Any table that reports NOTA recall (`nota_rate`) must report the false-alarm rate next to it, because a policy that always answers NOTA has recall 1.0.
+- On Windows set `PYTHONIOENCODING=utf-8` before printing prompts or contexts; about 1000 training contexts are non-ASCII.
 - Prompt format is exactly the one in the spec, ending in `Assistant: The answer is`. The decision token is the next token, one of `" A"` .. `" Z"`.
 - Cardinality is 2 to 26 inclusive. `noul` questions have choices exactly `["true", "false"]`. `score` questions must have `ordered: true`.
 - Batching uses right padding with pad id 50256. Logits are gathered at each row's last real token. Never left-pad (Eve ignores attention masks and has no position ids).
@@ -1884,7 +1887,7 @@ git commit -m "Add RL loop with rlvr, rlcd, and oracle arms"
 - Consumes: `load_eve`, `questions_to_batch`, `decision_logits`, `letter_token_ids`, `read_jsonl`, metrics from Task 5.
 - Produces:
   - `predict(model, tok, questions, max_len=512, batch_size=32, device="cuda") -> list[dict]` with keys `id, source, primitive, k, answer, logits (list of k floats), nota_index`
-  - `summarize(preds: list[dict], temperature: float = 1.0) -> dict` with keys `overall`, `by_primitive`, `by_source`, each a dict of `n, acc, brier, ece, nota_rate, mean_conf`
+  - `summarize(preds: list[dict], temperature: float = 1.0) -> dict` with keys `overall`, `by_primitive`, `by_source`, each a dict of `n, acc, brier, ece, nota_rate, nota_false_alarm, mean_conf`
   - `plot_reliability(preds_by_name: dict[str, list[dict]], out_png, temperature_by_name=None)`, `plot_coverage(preds_by_name, out_png, temperature_by_name=None)`
   - `fit_temperature(preds: list[dict]) -> float`
   - CLI `python -m rlcd.eval run --model runs/rlcd --split data/test.jsonl --out runs/rlcd/eval [--temperature 1.0]`
@@ -2004,7 +2007,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from rlcd.metrics import brier, coverage_error, ece, nota_rate, reliability_bins
+from rlcd.metrics import brier, coverage_error, ece, nota_false_alarm, nota_rate, reliability_bins
 from rlcd.policy import decision_logits, load_eve, questions_to_batch
 from rlcd.schema import NOTA, Question, letter_token_ids, read_jsonl
 
@@ -2046,6 +2049,7 @@ def _group_metrics(preds: list[dict], temperature: float) -> dict:
     probs, answers, pred, conf, correct, nota_index = _arrays(preds, temperature)
     return {"n": len(preds), "acc": float(correct.mean()), "brier": brier(probs, answers),
             "ece": ece(conf, correct), "nota_rate": nota_rate(pred, answers, nota_index),
+            "nota_false_alarm": nota_false_alarm(pred, answers, nota_index),
             "mean_conf": float(conf.mean())}
 
 
@@ -2115,13 +2119,15 @@ def cmd_compare(args):
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     plot_reliability(preds_by_name, out / "reliability.png")
     plot_coverage(preds_by_name, out / "coverage.png")
-    rows = ["| run | n | acc | brier | ECE | mean conf | NOTA rate |", "|---|---|---|---|---|---|---|"]
+    rows = ["| run | n | acc | Brier loss (lower is better) | ECE | mean conf | NOTA recall | NOTA false alarm |",
+            "|---|---|---|---|---|---|---|---|"]
     table = {}
     for name, preds in preds_by_name.items():
         m = summarize(preds)["overall"]
         table[name] = m
         nota = "n/a" if math.isnan(m["nota_rate"]) else f"{m['nota_rate']:.3f}"
-        rows.append(f"| {name} | {m['n']} | {m['acc']:.3f} | {m['brier']:.3f} | {m['ece']:.3f} | {m['mean_conf']:.3f} | {nota} |")
+        alarm = "n/a" if math.isnan(m["nota_false_alarm"]) else f"{m['nota_false_alarm']:.3f}"
+        rows.append(f"| {name} | {m['n']} | {m['acc']:.3f} | {m['brier']:.3f} | {m['ece']:.3f} | {m['mean_conf']:.3f} | {nota} | {alarm} |")
     (out / "table.md").write_text("\n".join(rows) + "\n")
     (out / "metrics.json").write_text(json.dumps(table, indent=2))
     print("\n".join(rows))
