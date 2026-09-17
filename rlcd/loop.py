@@ -22,6 +22,22 @@ def batch_indices(n: int, batch_size: int, rng: random.Random) -> Iterator[list[
         yield order[i:i + batch_size]
 
 
+def window_size(micro_index: int, n_micro: int, accum: int) -> int:
+    """Number of micro-batches in the accumulation window that holds micro_index. Every window
+    is full except possibly the last one. Dividing each micro-batch loss by this count makes
+    the accumulated gradient a mean over the window, so a trailing partial window is not
+    under-weighted."""
+    start = micro_index - micro_index % accum
+    return min(accum, n_micro - start)
+
+
+def slice_meta(questions: list, start: int) -> dict:
+    """Which rows of the training file a run used, for meta.json."""
+    return {"slice_start": start, "slice_rows": len(questions),
+            "slice_first_id": questions[0].id if questions else None,
+            "slice_last_id": questions[-1].id if questions else None}
+
+
 def save_checkpoint(model, tokenizer, out_dir: str, meta: dict) -> None:
     """Model and tokenizer go in the same directory: load_eve reads both from there."""
     out = Path(out_dir)

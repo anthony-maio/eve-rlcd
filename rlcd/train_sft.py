@@ -7,47 +7,26 @@ import time
 
 import torch
 
-from rlcd.loop import JsonlLogger, batch_indices, cosine_lr, save_checkpoint
+from rlcd.loop import JsonlLogger, batch_indices, cosine_lr, save_checkpoint, slice_meta, window_size
 from rlcd.policy import EVE_ID, decision_logits, load_eve, questions_to_batch
+from rlcd.quick_eval import evaluate, stride_sample
 from rlcd.rewards import supervised_loss
 from rlcd.schema import Question, letter_token_ids, read_jsonl
 
 
-def evaluate(model, tok, letters, questions: list[Question], max_len: int) -> dict:
-    """Accuracy, NLL of the true answer, confidence, and last-option rate, overall and
-    per source. Runs in eval mode without grad and restores the previous mode."""
-    device = next(model.parameters()).device
-    was_training = model.training
-    model.eval()
-    pred, conf, nll = [], [], []
-    with torch.no_grad():
-        for i in range(0, len(questions), 32):
-            batch = questions[i:i + 32]
-            ids, last, k = questions_to_batch(tok, batch, max_len, device)
-            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                logits, _ = decision_logits(model, ids, last, letters, k)
-            logp = torch.log_softmax(logits, -1)
-            truth = torch.tensor([q.answer for q in batch], device=device)
-            nll += (-logp.gather(1, truth[:, None])[:, 0]).cpu().tolist()
-            pred += logp.argmax(-1).cpu().tolist()
-            conf += logp.exp().max(-1).values.cpu().tolist()
-    model.train(was_training)
-    n = len(questions)
-    hits = [float(a == q.answer) for a, q in zip(pred, questions)]
-    out = {"eval_acc": sum(hits) / n, "eval_nll": sum(nll) / n, "eval_conf": sum(conf) / n,
-           "eval_pred_last": sum(float(a == q.k - 1) for a, q in zip(pred, questions)) / n}
-    for src in sorted({q.source for q in questions}):
-        rows = [h for h, q in zip(hits, questions) if q.source == src]
-        out[f"eval_acc_{src}"] = sum(rows) / len(rows)
-    return out
+def select_slice(rows: list, start: int, n: int) -> list:
+    """Rows [start, start + n) in file order. The training file is shuffled at build time, so
+    slices by file order are random samples, and the SFT and RL slices stay disjoint."""
+    return rows[start:start + n]
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="data/train.jsonl")
     ap.add_argument("--init", default=EVE_ID)
     ap.add_argument("--out", default="runs/sft")
-    ap.add_argument("--n", type=int, default=2000)
+    ap.add_argument("--start", type=int, default=0, help="first row of the slice, in file order")
+    ap.add_argument("--n", type=int, default=32000, help="number of rows in the slice")
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--micro", type=int, default=8)
     ap.add_argument("--accum", type=int, default=8)
@@ -57,20 +36,22 @@ def main():
     ap.add_argument("--eval-data", default="")
     ap.add_argument("--eval-every", type=int, default=0)
     ap.add_argument("--eval-n", type=int, default=2000)
-    args = ap.parse_args()
+    ap.add_argument("--no-save", action="store_true", help="skip the checkpoint; the log is still written")
+    return ap
+
+
+def main():
+    args = build_parser().parse_args()
 
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
-    qs = read_jsonl(args.data)
-    rng.shuffle(qs)
-    qs = qs[: args.n]
+    qs = select_slice(read_jsonl(args.data), args.start, args.n)
+    assert qs, "empty training slice"
     assert all(q.answer is not None for q in qs), "SFT needs a labeled answer on every row"
     answers = torch.tensor([q.answer for q in qs])
     eval_qs: list[Question] = []
     if args.eval_data and args.eval_every > 0:
-        # Stride sample: eval files are sorted by source, so a head slice would miss most of them.
-        eval_qs = read_jsonl(args.eval_data)
-        eval_qs = eval_qs[:: max(1, len(eval_qs) // args.eval_n)][: args.eval_n]
+        eval_qs = stride_sample(read_jsonl(args.eval_data), args.eval_n)
         assert all(q.answer is not None for q in eval_qs), "eval needs a labeled answer on every row"
 
     model, tok = load_eve(args.init, device="cuda")
@@ -78,11 +59,14 @@ def main():
     letters = letter_token_ids(tok)
     aux_coef = model.config.router_aux_loss_coef
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
-    steps_per_epoch = (len(qs) + args.micro * args.accum - 1) // (args.micro * args.accum)
-    total = steps_per_epoch * args.epochs
+    # Accumulation windows run across epoch boundaries, so count micro-batches over the whole run.
+    n_micro = args.epochs * ((len(qs) + args.micro - 1) // args.micro)
+    total = (n_micro + args.accum - 1) // args.accum
+    meta = vars(args) | slice_meta(qs, args.start)
     log = JsonlLogger(f"{args.out}/train_log.jsonl")
+    log.log(**slice_meta(qs, args.start), total_steps=total)
 
-    step, t0 = 0, time.time()
+    step, micro_index, t0 = 0, 0, time.time()
     window = {"n": 0, "loss": 0.0, "aux": 0.0, "hits": 0.0, "conf": 0.0, "micro": 0}
 
     def optimizer_step(epoch: int) -> None:
@@ -112,7 +96,8 @@ def main():
                 logits, aux = decision_logits(model, ids, last, letters, k)
             logp = torch.log_softmax(logits, -1)
             loss = supervised_loss(logp, answers[idx]) + aux_coef * aux
-            (loss / args.accum).backward()
+            (loss / window_size(micro_index, n_micro, args.accum)).backward()
+            micro_index += 1
             with torch.no_grad():
                 window["n"] += len(idx)
                 window["micro"] += 1
@@ -126,8 +111,11 @@ def main():
         # Trailing micro-batches that did not fill an accumulation window still get applied.
         optimizer_step(args.epochs - 1)
 
-    save_checkpoint(model, tok, args.out, vars(args) | {"steps": step})
-    print("saved", args.out)
+    if args.no_save:
+        print("checkpoint skipped (--no-save)")
+    else:
+        save_checkpoint(model, tok, args.out, meta | {"steps": step})
+        print("saved", args.out)
     print(f"wall_sec={time.time() - t0:.1f} peak_vram_mb={torch.cuda.max_memory_allocated() // 2**20}")
 
 
