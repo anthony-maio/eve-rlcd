@@ -16,6 +16,10 @@
 - Every Eve config is built or loaded through `rlcd.compat.eve_config(**kw)` or `rlcd.compat.load_eve_config(path_or_id)`. Never call the raw `EveConfig` constructor or `EveConfig.from_pretrained` directly, and never call `EveMoEForCausalLM.from_pretrained` without `config=load_eve_config(...)`. Reason: EveConfig's MoE routing field `top_k` collides with a legacy generation default in transformers 4.x, which silently overwrites it with 50.
 - The HF wrapper does not inherit `GenerationMixin` on transformers >= 4.50, so `model.generate()` is unavailable. Nothing in this project needs it; use an explicit greedy loop where text generation is wanted for a sanity check.
 - The ASCII rule exempts the vendored files under `rlcd/eve/`, which stay byte-identical to the hub.
+- `rlcd.policy.load_eve(path_or_id, device)` does NOT use `from_pretrained` for weights: transformers refuses the hub safetensors file (no format metadata). It builds the model from `load_eve_config`, reads `model.safetensors` directly, ties `lm_head` to `wte`, and raises on any missing or unexpected key. It reads the tokenizer from the same path, so every checkpoint directory must contain both `save_pretrained` model files and the tokenizer files. It returns the model in train mode; call `.eval()` for inference.
+- Any head computation on hidden states (decision logits, the amputated decision head) runs inside `torch.autocast(device_type=..., enabled=False)` in fp32. Autocast otherwise quantizes logits to bf16.
+- Memory: a training-like step at batch 32 x 149 tokens peaks near 8.3 GB. Activations scale with batch x tokens, so training defaults are micro-batch 8 with gradient accumulation. Check `torch.cuda.max_memory_allocated()` in smoke runs.
+- Log the router aux loss with `aux.detach().item()`, never `float(aux)` on a tensor that requires grad.
 - Prompt format is exactly the one in the spec, ending in `Assistant: The answer is`. The decision token is the next token, one of `" A"` .. `" Z"`.
 - Cardinality is 2 to 26 inclusive. `noul` questions have choices exactly `["true", "false"]`. `score` questions must have `ordered: true`.
 - Batching uses right padding with pad id 50256. Logits are gathered at each row's last real token. Never left-pad (Eve ignores attention masks and has no position ids).
@@ -583,12 +587,16 @@ def decision_logits(model, input_ids, last_idx, letter_ids: list[int], k: torch.
     """fp32 logits over the 26 letters at each row's decision position.
     Positions at or beyond k are set to NEG so their softmax mass is exactly zero."""
     hidden, aux = eve_hidden(model, input_ids)
-    rows = hidden[torch.arange(hidden.size(0), device=hidden.device), last_idx]
-    weight = model.lm_head.weight[torch.as_tensor(letter_ids, device=hidden.device)]
-    logits = rows.float() @ weight.float().t()
-    positions = torch.arange(MAX_CHOICES, device=logits.device)[None, :]
-    mask = positions >= k.to(logits.device)[:, None]
-    return logits.masked_fill(mask, NEG), aux
+    # Autocast would re-downcast this matmul to bf16 and quantize the decision logits,
+    # so the head always runs with autocast disabled.
+    with torch.autocast(device_type=hidden.device.type, enabled=False):
+        rows = hidden[torch.arange(hidden.size(0), device=hidden.device), last_idx]
+        weight = model.lm_head.weight[torch.as_tensor(letter_ids, device=hidden.device)]
+        logits = rows.float() @ weight.float().t()
+        positions = torch.arange(MAX_CHOICES, device=logits.device)[None, :]
+        mask = positions >= k.to(logits.device)[:, None]
+        logits = logits.masked_fill(mask, NEG)
+    return logits, aux
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -1433,7 +1441,7 @@ git commit -m "Add dataset converters, NOTA injection, and synthetic triage"
   - `batch_indices(n: int, batch_size: int, rng: random.Random) -> Iterator[list[int]]` (shuffled, last partial batch kept)
   - `save_checkpoint(model, tokenizer, out_dir: str, meta: dict) -> None` (writes HF files plus `meta.json`)
   - `JsonlLogger(path)` with `.log(**kw)`
-  - CLI `python -m rlcd.train_sft --data data/train.jsonl --out runs/sft --n 2000 --epochs 1 --micro 16 --accum 4 --lr 5e-5 --max-len 512 --seed 0`
+  - CLI `python -m rlcd.train_sft --data data/train.jsonl --out runs/sft --n 2000 --epochs 1 --micro 8 --accum 8 --lr 5e-5 --max-len 512 --seed 0`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1548,8 +1556,8 @@ def main():
     ap.add_argument("--out", default="runs/sft")
     ap.add_argument("--n", type=int, default=2000)
     ap.add_argument("--epochs", type=int, default=1)
-    ap.add_argument("--micro", type=int, default=16)
-    ap.add_argument("--accum", type=int, default=4)
+    ap.add_argument("--micro", type=int, default=8)
+    ap.add_argument("--accum", type=int, default=8)
     ap.add_argument("--lr", type=float, default=5e-5)
     ap.add_argument("--max-len", type=int, default=512)
     ap.add_argument("--seed", type=int, default=0)
@@ -1606,7 +1614,7 @@ if __name__ == "__main__":
 ```powershell
 uv run python -m rlcd.train_sft --data data/triage-only/train.jsonl --out runs/smoke-sft --n 200 --micro 8 --accum 2
 ```
-Expected: about 13 optimizer steps, loss falling from around 1.4 toward under 1.0, `acc` rising, checkpoint written to `runs/smoke-sft` with `model.safetensors`, `config.json`, tokenizer files, `meta.json`. VRAM stays well under 16 GB. If you see `CUDA out of memory`, lower `--micro` to 8 and raise `--accum`.
+Expected: about 13 optimizer steps, loss falling from around 1.4 toward under 1.0, `acc` rising, checkpoint written to `runs/smoke-sft` with `model.safetensors`, `config.json`, tokenizer files, `meta.json`. VRAM stays well under 16 GB. Print `torch.cuda.max_memory_allocated()` at the end of the run. If you see `CUDA out of memory`, halve `--micro` and double `--accum`.
 
 - [ ] **Step 7: Verify the checkpoint reloads with the tie intact**
 
@@ -1618,7 +1626,7 @@ Expected: `ok True`.
 - [ ] **Step 8: Run the real warmup**
 
 ```powershell
-uv run python -m rlcd.train_sft --data data/train.jsonl --out runs/sft --n 2000 --epochs 1 --micro 16 --accum 4 --lr 5e-5
+uv run python -m rlcd.train_sft --data data/train.jsonl --out runs/sft --n 2000 --epochs 1 --micro 8 --accum 8 --lr 5e-5
 ```
 Expected: about 32 steps, a few minutes. Final `acc` above chance for a mixed batch (chance is roughly 0.15 given the cardinality mix). Note the final loss in `runs/sft/train_log.jsonl`.
 
@@ -1641,7 +1649,7 @@ git commit -m "Add training utilities and warmup SFT"
 - Consumes: everything from Tasks 3, 4, 7.
 - Produces:
   - `rl_step(model, ref_model, tok, letters, batch: list[Question], idx: LongTensor, env: BanditEnv, arm: str, group: int, kl_coef: float, aux_coef: float, max_len: int) -> tuple[Tensor loss, dict stats]`
-  - CLI `python -m rlcd.train_rl --init runs/sft --arm rlcd --out runs/rlcd --data data/train.jsonl --epochs 1 --micro 16 --accum 8 --lr 2e-5 --group 4 --kl 0.05 --max-len 512 --limit 0 --seed 0`
+  - CLI `python -m rlcd.train_rl --init runs/sft --arm rlcd --out runs/rlcd --data data/train.jsonl --epochs 1 --micro 8 --accum 16 --lr 2e-5 --group 4 --kl 0.05 --max-len 512 --limit 0 --seed 0`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1765,7 +1773,7 @@ def rl_step(model, ref_model, tok, letters, batch: list[Question], idx: torch.Te
     kl = kl_categorical(logp, logp_ref).mean()
     loss = objective + kl_coef * kl + aux_coef * aux
     stats.update(loss=loss.item(), kl=kl.item(), mean_conf=probs.max(-1).values.mean().item(),
-                 aux=float(aux))
+                 aux=aux.detach().item())
     return loss, stats
 
 
@@ -1776,8 +1784,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--data", default="data/train.jsonl")
     ap.add_argument("--epochs", type=int, default=1)
-    ap.add_argument("--micro", type=int, default=16)
-    ap.add_argument("--accum", type=int, default=8)
+    ap.add_argument("--micro", type=int, default=8)
+    ap.add_argument("--accum", type=int, default=16)
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--group", type=int, default=4)
     ap.add_argument("--kl", type=float, default=0.05)
@@ -2364,7 +2372,7 @@ class DecisionModel:
         k = torch.tensor([q.k for q in questions], device=self.device)
         hidden, _ = eve_hidden(self.model, ids)
         rows = hidden[torch.arange(len(questions), device=self.device), last].float()
-        logits = self.head(rows)
+        logits = self.head(rows)  # fp32: this method never runs under autocast
         mask = torch.arange(MAX_CHOICES, device=self.device)[None, :] >= k[:, None]
         return torch.softmax(logits.masked_fill(mask, NEG), -1).cpu()
 
