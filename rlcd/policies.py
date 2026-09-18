@@ -7,8 +7,10 @@ placed right after the prompt.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Protocol
 
@@ -22,6 +24,17 @@ BACKENDS = ("eve", "hf-decoder", "hf-mlm")
 POLICY_FILE = "policy.json"
 LORA = dict(r=32, lora_alpha=64, lora_dropout=0.0, target_modules="all-linear")
 
+
+
+@dataclass(frozen=True)
+class PinnedCode:
+    """The exact commit of a hub repo whose custom code was read, and the sha256 of every code
+    file at that commit. A hub load pins the commit; a local checkpoint of that repo carries a
+    copy of the code, which transformers imports as is, so the copy is checked against the hash."""
+    revision: str
+    files: dict[str, str]
+
+
 # Hub repos whose custom modeling code has been read and judged safe, each pinned to the exact
 # commit that was read. trust_remote_code is never enabled for anything that is not listed here.
 #
@@ -30,8 +43,10 @@ LORA = dict(r=32, lora_alpha=64, lora_dropout=0.0, target_modules="all-linear")
 # transformers lfm2 module for the whole process at import time (create_causal_mask becomes a
 # padding-only mask, Lfm2ShortConv becomes a symmetric non-causal convolution). So never load it
 # in a process that also runs a causal LFM2 decoder: that decoder would silently stop being causal.
-PINNED_REMOTE_CODE: dict[str, str] = {
-    "LiquidAI/LFM2.5-Encoder-350M": "b886781f7c6f10ca9b7096e21b83e30a073c2f39",
+PINNED_REMOTE_CODE: dict[str, PinnedCode] = {
+    "LiquidAI/LFM2.5-Encoder-350M": PinnedCode(
+        "b886781f7c6f10ca9b7096e21b83e30a073c2f39",
+        {"modeling_lfm2_bidirectional.py": "f171f518be2a07da48b17fdea5655cad0a2452ab548e90e8ae903143686647e2"}),
 }
 
 
@@ -56,15 +71,65 @@ class Policy(Protocol):
     def eval(self) -> "Policy": ...
 
 
-def remote_code_kwargs(path_or_id: str, base: str | None = None) -> dict:
+def _read_json(path: str) -> dict:
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _local_code_references(directory: str) -> list[str]:
+    """Every custom-code reference a checkpoint directory makes: the auto_map values of its
+    config.json and tokenizer_config.json, flattened (tokenizer entries are [slow, fast] pairs)."""
+    refs: list[str] = []
+    for name in ("config.json", "tokenizer_config.json"):
+        for value in (_read_json(os.path.join(directory, name)).get("auto_map") or {}).values():
+            for ref in value if isinstance(value, (list, tuple)) else [value]:
+                if ref is not None:
+                    refs.append(ref)
+    return refs
+
+
+def _verify_local_code(directory: str, origin: str, pin: PinnedCode) -> bool:
+    """True when the directory names custom code, all of it matching the reviewed files of its
+    origin; False when it names none. Raises on anything else. save_pretrained copies the modeling
+    file into the directory and names it in auto_map without a repo prefix, and transformers then
+    imports that local copy, ignoring code_revision. A reference that keeps a repo prefix is
+    fetched from that repo instead, at code_revision, so it only has to point back at the origin."""
+    refs = _local_code_references(directory)
+    for ref in refs:
+        if "--" in ref:
+            repo, ref = ref.split("--", 1)
+            if repo != origin:
+                raise RuntimeError(f"{directory} pulls custom code from {repo}, which is not its "
+                                   f"pinned origin {origin}")
+            continue
+        module_file = ref.split(".")[0] + ".py"
+        path = os.path.join(directory, module_file)
+        if module_file not in pin.files:
+            raise RuntimeError(f"{directory} names custom code in {module_file}, which is not among "
+                               f"the reviewed files of {origin}: {sorted(pin.files)}")
+        if not os.path.isfile(path):
+            raise RuntimeError(f"{directory} names custom code in {module_file}, which is missing")
+        with open(path, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        if digest != pin.files[module_file]:
+            raise RuntimeError(f"{path} does not match the reviewed {module_file} of {origin} at "
+                               f"{pin.revision}: sha256 {digest}, expected {pin.files[module_file]}")
+    return bool(refs)
+
+
+def remote_code_kwargs(path_or_id: str, origin: str | None = None) -> dict:
     """from_pretrained kwargs that enable custom code, only for a pinned repo. A local checkpoint
-    of a pinned base keeps an auto_map that points back at the hub repo, so its code is pinned
-    with code_revision; the weights come from the directory."""
+    whose origin is pinned is trusted only after every code file it names hashes to the reviewed
+    one; a directory that names no custom code needs no trust at all."""
     path_or_id = os.fspath(path_or_id)
     if path_or_id in PINNED_REMOTE_CODE:
-        return {"trust_remote_code": True, "revision": PINNED_REMOTE_CODE[path_or_id]}
-    if base in PINNED_REMOTE_CODE and os.path.isdir(path_or_id):
-        return {"trust_remote_code": True, "code_revision": PINNED_REMOTE_CODE[base]}
+        return {"trust_remote_code": True, "revision": PINNED_REMOTE_CODE[path_or_id].revision}
+    if origin in PINNED_REMOTE_CODE and os.path.isdir(path_or_id):
+        pin = PINNED_REMOTE_CODE[origin]
+        if _verify_local_code(path_or_id, origin, pin):
+            return {"trust_remote_code": True, "code_revision": pin.revision}
     return {}
 
 
@@ -290,11 +355,7 @@ class HFMaskedLMPolicy(_HFPolicy):
 
 
 def _read_record(path_or_id: str) -> dict:
-    path = os.path.join(path_or_id, POLICY_FILE)
-    if os.path.isfile(path):
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    return _read_json(os.path.join(path_or_id, POLICY_FILE))
 
 
 def resolve_backend(path_or_id: str, backend: str = "auto") -> str:

@@ -456,16 +456,102 @@ def test_hf_mlm_truncation_keeps_the_mask_token(mask_tok):
 def test_remote_code_is_only_trusted_for_reviewed_and_pinned_revisions(tmp_path):
     from rlcd.policies import PINNED_REMOTE_CODE, remote_code_kwargs
     assert set(PINNED_REMOTE_CODE) <= {"LiquidAI/LFM2.5-Encoder-350M"}
-    for revision in PINNED_REMOTE_CODE.values():
-        assert len(revision) == 40 and set(revision) <= set("0123456789abcdef")  # a full commit sha
+    for pin in PINNED_REMOTE_CODE.values():
+        assert len(pin.revision) == 40 and set(pin.revision) <= set("0123456789abcdef")  # a full commit sha
+        for name, digest in pin.files.items():
+            assert name.endswith(".py")
+            assert len(digest) == 64 and set(digest) <= set("0123456789abcdef")  # a full sha256
     assert remote_code_kwargs("someone/unknown-custom-encoder") == {}
     assert remote_code_kwargs("Qwen/Qwen3-0.6B-Base") == {}
-    for repo, revision in PINNED_REMOTE_CODE.items():
-        assert remote_code_kwargs(repo) == {"trust_remote_code": True, "revision": revision}
-        # A local fine-tune of a pinned base still resolves its code at the pinned commit.
-        assert remote_code_kwargs(str(tmp_path), base=repo) == {"trust_remote_code": True,
-                                                                "code_revision": revision}
-    assert remote_code_kwargs(str(tmp_path), base="someone/unknown-custom-encoder") == {}
+    for repo, pin in PINNED_REMOTE_CODE.items():
+        assert remote_code_kwargs(repo) == {"trust_remote_code": True, "revision": pin.revision}
+    # A directory that names no custom code needs no trust, whatever its origin.
+    assert remote_code_kwargs(str(tmp_path), origin="LiquidAI/LFM2.5-Encoder-350M") == {}
+    assert remote_code_kwargs(str(tmp_path), origin="someone/unknown-custom-encoder") == {}
+
+
+def test_the_pinned_encoder_table_matches_the_reviewed_file():
+    import hashlib
+    from huggingface_hub import try_to_load_from_cache
+
+    from rlcd.policies import PINNED_REMOTE_CODE
+    pin = PINNED_REMOTE_CODE["LiquidAI/LFM2.5-Encoder-350M"]
+    assert pin.revision == "b886781f7c6f10ca9b7096e21b83e30a073c2f39"
+    assert pin.files == {"modeling_lfm2_bidirectional.py":
+                         "f171f518be2a07da48b17fdea5655cad0a2452ab548e90e8ae903143686647e2"}
+    cached = try_to_load_from_cache("LiquidAI/LFM2.5-Encoder-350M", "modeling_lfm2_bidirectional.py",
+                                    revision=pin.revision)
+    if not isinstance(cached, str):
+        pytest.skip("the pinned encoder is not in the local Hugging Face cache")
+    with open(cached, "rb") as f:
+        assert hashlib.sha256(f.read()).hexdigest() == pin.files["modeling_lfm2_bidirectional.py"]
+
+
+def _custom_code_dir(tmp_path, source: str, auto_map: dict, name: str = "modeling_fake.py"):
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / name).write_bytes(source.encode())  # exact bytes: write_text would add \r on Windows
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "bert", "auto_map": auto_map}))
+    return str(tmp_path)
+
+
+def test_local_custom_code_is_trusted_only_when_it_hashes_to_the_reviewed_file(tmp_path, monkeypatch):
+    """save_pretrained copies the modeling file into the run directory and names it in auto_map
+    without a repo prefix, and transformers then imports that local file, ignoring
+    code_revision. So the local file itself has to match the reviewed one."""
+    import hashlib
+
+    import rlcd.policies as policies
+    from rlcd.policies import PinnedCode, remote_code_kwargs
+    genuine = "import torch\nclass FakeModel(torch.nn.Module):\n    pass\n"
+    pin = PinnedCode("b" * 40, {"modeling_fake.py": hashlib.sha256(genuine.encode()).hexdigest()})
+    monkeypatch.setattr(policies, "PINNED_REMOTE_CODE", {"fake/pinned": pin})
+    auto_map = {"AutoModelForMaskedLM": "modeling_fake.FakeModel"}
+
+    good = _custom_code_dir(tmp_path / "good", genuine, auto_map)
+    assert remote_code_kwargs(good, origin="fake/pinned") == {"trust_remote_code": True,
+                                                              "code_revision": "b" * 40}
+    assert remote_code_kwargs(good, origin="someone/else") == {}
+    assert remote_code_kwargs(good) == {}
+
+    tampered = _custom_code_dir(tmp_path / "tampered", genuine + "import os\n", auto_map)
+    with pytest.raises(RuntimeError, match="modeling_fake.py"):
+        remote_code_kwargs(tampered, origin="fake/pinned")
+
+    # A second module smuggled in through another auto_map entry is refused too, as is a
+    # missing file, and a prefixed reference that points at some other repo.
+    other = _custom_code_dir(tmp_path / "other", genuine, auto_map | {"AutoConfig": "configuration_x.Cfg"})
+    (tmp_path / "other" / "configuration_x.py").write_text("x = 1\n")
+    with pytest.raises(RuntimeError, match="configuration_x.py"):
+        remote_code_kwargs(other, origin="fake/pinned")
+    missing = _custom_code_dir(tmp_path / "missing", genuine, auto_map)
+    (tmp_path / "missing" / "modeling_fake.py").unlink()
+    with pytest.raises(RuntimeError, match="modeling_fake.py"):
+        remote_code_kwargs(missing, origin="fake/pinned")
+    elsewhere = _custom_code_dir(tmp_path / "elsewhere", genuine,
+                                 {"AutoModel": "someone/else--modeling_fake.FakeModel"} | auto_map)
+    with pytest.raises(RuntimeError, match="someone/else"):
+        remote_code_kwargs(elsewhere, origin="fake/pinned")
+    # A prefixed reference back at the pinned repo is fetched at code_revision, so it is fine.
+    prefixed = _custom_code_dir(tmp_path / "prefixed", genuine,
+                                {"AutoModel": "fake/pinned--modeling_fake.FakeModel"} | auto_map)
+    assert remote_code_kwargs(prefixed, origin="fake/pinned")["trust_remote_code"] is True
+    # Tokenizer code named in tokenizer_config.json is held to the same rule.
+    tok_dir = _custom_code_dir(tmp_path / "tok", genuine, auto_map)
+    (tmp_path / "tok" / "tokenization_fake.py").write_text("y = 2\n")
+    (tmp_path / "tok" / "tokenizer_config.json").write_text(json.dumps(
+        {"auto_map": {"AutoTokenizer": ["tokenization_fake.FakeTok", None]}}))
+    with pytest.raises(RuntimeError, match="tokenization_fake.py"):
+        remote_code_kwargs(tok_dir, origin="fake/pinned")
+
+
+def test_loading_a_tampered_local_checkpoint_of_a_pinned_base_is_refused(tmp_path, monkeypatch):
+    import rlcd.policies as policies
+    from rlcd.policies import PinnedCode
+    monkeypatch.setattr(policies, "PINNED_REMOTE_CODE", {"fake/pinned": PinnedCode("b" * 40, {"modeling_fake.py": "0" * 64})})
+    ckpt = _custom_code_dir(tmp_path, "import os\n", {"AutoModelForMaskedLM": "modeling_fake.FakeModel"})
+    (tmp_path / "policy.json").write_text(json.dumps({"backend": "hf-mlm", "lora": False, "origin": "fake/pinned"}))
+    with pytest.raises(RuntimeError, match="modeling_fake.py"):
+        load_policy(ckpt, device="cpu")
 
 
 # ---------- repos written by transformers 5 ----------
