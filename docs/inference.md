@@ -19,7 +19,7 @@ answers = d.ask(
     [ChoiceQ("Which department should handle this ticket?",
              ["BILLING", "INFRASTRUCTURE", "SECURITY", "PRODUCT_SUPPORT"]),
      ScoreQ("What is the priority of this ticket?", ["P3_LOW", "P2_NORMAL", "P1_HIGH", "P0_CRITICAL"]),
-     NoulQ("an on-call engineer should be paged immediately")])
+     NoulQ("Should an on-call engineer be paged immediately?")])
 ```
 
 The primitives:
@@ -27,8 +27,20 @@ The primitives:
 - `ChoiceQ(question, options)`: 2..26 unordered options. Answer: `kind`, `value` (the most probable
   option), `probs` (option -> probability), `confidence`, `entropy_confidence`.
 - `ScoreQ(question, levels)`: 2..26 ordered levels, low to high. Answer: the choice fields plus `score`.
-- `NoulQ(proposition)`: rendered as the question `Is this true: <proposition>` with the options `true`
-  and `false`. Answer: `kind`, `p_true`, `confidence`.
+- `NoulQ(question)`: a yes/no question, rendered verbatim with the options `true` and `false`, exactly
+  as the noul rows of the training data are rendered (their questions are literal yes/no questions
+  such as `Should an on-call engineer be paged immediately?`). Answer: `kind`, `p_true`, `confidence`.
+  Phrase it as a question; a bare proposition is a prompt the model was not trained on.
+
+`ask` runs the model body in fp32 by default, which makes it agree with the training-time path to
+about 1e-6 (see Equivalence). `fast=True`, on the call or on `Decider.load`, runs the body under bf16
+autocast on CUDA: cheaper at large question counts (see Latency), at the cost of the bf16 rounding noise
+that the training-time path itself has. The decision head runs in fp32 either way.
+
+The trained and evaluated range is prompts of up to 512 tokens (the training `max_len`; the longest
+test prompt is 473 tokens). The API accepts states up to `max_state_tokens` (default 1536) and question
+suffixes up to `max_question_tokens` (default 448), but a prompt beyond about 500 tokens is outside
+the range the model was trained and evaluated on, and its calibration there is unmeasured.
 
 The confidence fields are our own definitions, not standard ones:
 
@@ -97,118 +109,137 @@ latency comparison.
 
 ## Equivalence and independence
 
-`scripts/check_decide.py --model runs/q-rlcd` (results in `runs/decide-bench/equivalence.json`).
-300 test rows in 205 context groups (56 groups with 2 to 37 questions sharing a context, the rest
-single), every group asked together, and again with 1, 5 and 20 unrelated questions from other rows
-mixed in. Every probability over the declared options is compared. Tokenization split first: over all
-8000 test rows, tokenizing the prefix and the suffix separately gives exactly the tokens of the whole
-prompt on every row (0 failures); the fallback split before the last newline of the prefix fails on all
-8000 rows, because the Qwen3 tokenizer keeps `\n\n` as one token.
+`scripts/check_decide.py --model runs/q-rlcd` (results in `runs/decide-bench/equivalence.json`, log in
+`runs/decide-bench/check.log`). 300 test rows in 205 context groups (56 groups with 2 to 37 questions
+sharing a context, the rest single), every group asked together, and again with 1, 5 and 20 unrelated
+questions from other rows mixed in. Every probability over the declared options is compared. Dataset
+rows go through the primitives that render them verbatim (`NoulQ` included). Tokenization split first:
+over all 8000 test rows, tokenizing the prefix and the suffix separately gives exactly the tokens of
+the whole prompt on every row (0 failures); the fallback split before the last newline of the prefix
+fails on all 8000 rows, because the Qwen3 tokenizer keeps `\n\n` as one token.
 
-With the body in fp32 (tolerance 1e-5): pass.
+With the body in fp32, the default (tolerance 1e-5):
+
+| check | max abs diff | mean abs diff | probabilities |
+|---|---|---|---|
+| ask vs sequential | 3.7e-6 | 9.8e-8 | 1493 |
+| ask with 1, 5, 20 unrelated questions added vs sequential | 1.08e-5 | 1.3e-7 | 4479 |
+| independence: adding unrelated questions | 4.4e-6 | 1.0e-7 | 4479 |
+| independence: asking one question alone | 1.9e-6 | 1.2e-7 | 194 |
+| independence: reversing the order | 0 | 0 | 486 |
+| sequential at batch size 1 vs batch size 32 (the reference against itself) | 6.6e-6 | 6.1e-8 | 1493 |
+
+Every check but one is under 1e-5; the one is a single probability out of 4479 at 1.08e-5, in the
+check that mixes in 20 unrelated questions, and the reference path disagrees with itself by 6.6e-6 over
+the same rows when only its batch size changes. So the script reports the fp32 check as failed at the
+stated tolerance and the numbers are given as measured, rather than the tolerance being moved; the
+agreement is at the fp32 rounding floor of the reference itself (`torch.get_float32_matmul_precision()`
+is `highest`, TF32 off). The same check on the real checkpoint with eager attention instead of sdpa
+(120 rows): ask vs sequential 1.4e-6, and the eager and sdpa results agree with each other at 2.2e-6.
+
+Under bf16 autocast, `fast=True` (tolerance 1e-4): does not pass, and the numbers say why.
 
 | check | max abs diff | mean abs diff |
 |---|---|---|
-| ask vs sequential | 2.3e-6 | 9.4e-8 |
-| ask with 1, 5, 20 unrelated questions added vs sequential | 3.3e-6 | 1.3e-7 |
-| independence: adding unrelated questions | 4.4e-6 | 1.1e-7 |
-| independence: asking one question alone | 1.8e-6 | 1.4e-7 |
+| ask vs sequential | 2.2e-2 | 6.1e-4 |
+| ask with unrelated questions added vs sequential | 4.3e-2 | 5.3e-4 |
+| independence: adding unrelated questions | 4.1e-2 | 3.4e-4 |
+| independence: asking one question alone | 1.0e-2 | 3.6e-4 |
 | independence: reversing the order | 0 | 0 |
-| sequential at batch size 1 vs batch size 32 (the reference against itself) | 2.4e-6 | 4.6e-8 |
-
-Under bf16 autocast (tolerance 1e-4): does not pass, and the numbers say why.
-
-| check | max abs diff | mean abs diff |
-|---|---|---|
-| ask vs sequential | 2.7e-2 | 6.0e-4 |
-| ask with unrelated questions added vs sequential | 3.0e-2 | 5.4e-4 |
-| independence: adding unrelated questions | 2.6e-2 | 3.3e-4 |
-| independence: asking one question alone | 1.0e-2 | 3.7e-4 |
-| independence: reversing the order | 0 | 0 |
-| sequential at batch size 1 vs batch size 32 (the reference against itself) | 3.4e-2 | 3.2e-4 |
+| sequential at batch size 1 vs batch size 32 (the reference against itself) | 2.3e-2 | 3.1e-4 |
 | ask (bf16) vs sequential (fp32) | 1.9e-2 | 6.2e-4 |
-| sequential (bf16) vs sequential (fp32) | 3.7e-2 | 6.7e-4 |
+| sequential (bf16) vs sequential (fp32) | 2.9e-2 | 6.8e-4 |
 
-The fp32 agreement at 2e-6 shows that the split, the positions and the mask are exact. The bf16
-differences are not from the cached path: the training-time path disagrees with itself by 3.4e-2 when
-only the batch size changes, and the bf16 cached path sits closer to the fp32 single pass (1.9e-2) than
-the bf16 training-time path does (3.7e-2). What moves the numbers is that a bf16 matmul or attention
-call gives slightly different roundings when its shape changes (the batch and sequence dimensions pick
-the kernel and the reduction order), and those roundings compound over 28 layers; reordering questions
-keeps every shape and gives bit-identical results, adding a question changes the shapes and does not.
-No two computations with different shapes agree to 1e-4 in bf16 on this model, so the bf16 bound is
-not something the cached path can meet against a reference that does not meet it either. The maxima
-sit at near-tie decisions; the mean absolute difference is 6e-4.
+The fp32 agreement shows that the split, the positions and the mask are exact. The bf16 differences
+are not from the cached path: the training-time path disagrees with itself by 2.3e-2 when only the
+batch size changes, and the bf16 cached path sits closer to the fp32 single pass (1.9e-2) than the bf16
+training-time path does (2.9e-2). What moves the numbers is that a bf16 matmul or attention call gives
+slightly different roundings when its shape changes (the batch and sequence dimensions pick the kernel
+and the reduction order), and those roundings compound over 28 layers; reordering questions keeps
+every shape and gives bit-identical results, adding a question changes the shapes and does not. No
+two computations with different shapes agree to 1e-4 in bf16 on this model, which is why fp32 is the
+default and bf16 is an explicit `fast=True`. The bf16 maxima sit at near-tie decisions; the mean
+absolute difference is 6e-4.
 
 ## Latency
 
-`scripts/bench_decide.py`, RTX 4080, bf16 autocast with the fp32 head, medians of 7 runs after 2
-warmups, in milliseconds. `ask` is one prefill of the state and one batched forward over the question
-suffixes; `sequential` is every full prompt through the training-time path, right-padded in batches of
-32. The state is a synthetic ticket log cut to the stated token count; the questions are 4-option (or
-k-option) choice questions in the triage style. Peak memory 4.8 GB (the fp32 weights are 2.4 GB).
+`scripts/bench_decide.py`, RTX 4080, medians of 7 runs after 2 warmups, in milliseconds. `ask` is one
+prefill of the state and one batched forward over the question suffixes; `sequential` is every full
+prompt through the training-time path, right-padded in batches of 32. `fp32` is the body in fp32 (the
+default); `fast` is the body under bf16 autocast (`fast=True`); the decision head is fp32 in every
+column. The state is a synthetic ticket log cut to the stated token count; the questions are 4-option
+(or k-option) choice questions in the triage style. Peak memory 4.8 GB (the fp32 weights are 2.4 GB).
+Speedups are sequential over ask at the same precision.
 
 (a) question count, one 800-token state, 4 options each
 
-| questions | ask (ms) | sequential (ms) | speedup |
-|---|---|---|---|
-| 1 | 99.7 | 55.9 | 0.56x |
-| 2 | 99.3 | 65.0 | 0.65x |
-| 4 | 94.2 | 107.1 | 1.14x |
-| 8 | 89.5 | 229.7 | 2.57x |
-| 16 | 114.7 | 508.1 | 4.43x |
-| 32 | 174.5 | 1023.7 | 5.87x |
-| 64 | 305.5 | 2044.4 | 6.69x |
+| questions | ask fp32 | ask fast | sequential fp32 | sequential fast | speedup fp32 | speedup fast |
+|---|---|---|---|---|---|---|
+| 1 | 95.0 | 101.2 | 69.4 | 55.7 | 0.73x | 0.55x |
+| 2 | 97.0 | 83.0 | 109.3 | 55.2 | 1.13x | 0.67x |
+| 4 | 92.2 | 88.4 | 216.3 | 102.7 | 2.35x | 1.16x |
+| 8 | 105.3 | 84.8 | 440.9 | 222.2 | 4.19x | 2.62x |
+| 16 | 148.5 | 110.4 | 910.0 | 491.3 | 6.13x | 4.45x |
+| 32 | 261.2 | 162.8 | 1832.2 | 995.3 | 7.01x | 6.11x |
+| 64 | 472.2 | 302.3 | 3679.1 | 1983.5 | 7.79x | 6.56x |
 
 (b) state length, 8 questions, 4 options each
 
-| state tokens | ask (ms) | sequential (ms) | speedup |
-|---|---|---|---|
-| 200 | 93.4 | 60.7 | 0.65x |
-| 800 | 86.8 | 228.6 | 2.63x |
-| 1500 | 109.5 | 503.0 | 4.59x |
+| state tokens | ask fp32 | ask fast | sequential fp32 | sequential fast | speedup fp32 | speedup fast |
+|---|---|---|---|---|---|---|
+| 200 | 65.7 | 84.7 | 117.8 | 61.5 | 1.79x | 0.73x |
+| 800 | 106.9 | 79.1 | 444.2 | 222.4 | 4.16x | 2.81x |
+| 1500 | 188.3 | 111.6 | 989.5 | 486.9 | 5.25x | 4.36x |
 
 (c) option count, 8 questions, one 800-token state
 
-| options | ask (ms) | sequential (ms) | speedup |
-|---|---|---|---|
-| 2 | 93.1 | 226.8 | 2.44x |
-| 5 | 103.1 | 231.2 | 2.24x |
-| 10 | 98.2 | 242.1 | 2.47x |
-| 26 | 114.0 | 275.7 | 2.42x |
+| options | ask fp32 | ask fast | sequential fp32 | sequential fast | speedup fp32 | speedup fast |
+|---|---|---|---|---|---|---|
+| 2 | 102.2 | 86.3 | 437.9 | 219.7 | 4.28x | 2.54x |
+| 5 | 115.4 | 79.9 | 446.3 | 223.9 | 3.87x | 2.80x |
+| 10 | 129.7 | 87.1 | 473.7 | 236.0 | 3.65x | 2.71x |
+| 26 | 179.6 | 106.7 | 532.4 | 267.8 | 2.96x | 2.51x |
 
 How to read it. The sequential path scales with questions x (state + suffix) tokens, the cached path
 with state + questions x suffix tokens, so `ask` is nearly flat in the state length and grows slowly in
-the question count. Below about 4 questions on an 800-token state, or on a 200-token state, the
-sequential path is faster: a single forward of this 28-layer model in eager mode costs about 45 ms of
-launch overhead regardless of length (a 40-token forward and an 840-token forward take the same time),
-and `ask` is two forwards. Above that the shared prefix pays for itself, up to 6.7x at 64 questions.
+the question count. The fp32 body costs `ask` little at small sizes (0.94x at 1 question, where the
+autocast bookkeeping of `fast` costs more than the bf16 kernels save) and more as the work grows: 1.24x
+at 8 questions, 1.60x at 32, 1.56x at 64, 1.69x at a 1500-token state. Below about 2 questions on an
+800-token state the sequential path is faster in either precision: a single forward of this 28-layer
+model in eager mode costs about 45 ms of launch overhead regardless of length (a 40-token forward and
+an 840-token forward take the same time), and `ask` is two forwards. Above that the shared prefix pays
+for itself, up to 7.8x (fp32) or 6.6x (fast) at 64 questions.
 
 One implementation detail found by the benchmark: the sdpa attention integration of transformers 4.57
 passes `enable_gqa=True` to torch whenever there is no attention mask, and on this torch build (no
 flash attention compiled in) grouped-query attention without a mask falls back to the unfused math
 kernel, about 8x slower per layer than the fused kernel that runs when the key/value heads are
 repeated. A batch-1 prefill has no padding and so no mask, which made the prefill of a 1500-token
-state cost about 140 ms. `Decider.prefill` therefore passes an explicit 4D causal mask, which routes
-the prefill to the fused kernel (52 ms for 1500 tokens) and leaves the result unchanged (the fp32
-equivalence above was measured with it).
+state cost about 140 ms. `Decider.prefill` therefore passes an explicit causal mask, which routes the
+prefill to the fused kernel (52 ms for 1500 tokens). The mask is an additive 4D float mask in the dtype
+of the attention scores (bf16 under `fast`, else the weights' dtype), because sdpa refuses a float
+mask of another dtype and eager attention adds whatever mask it is given to the scores, so a boolean
+mask would have made an eager-attention prefill acausal; `tests/test_decide.py` asserts that `ask`
+equals `ask_sequential` under both `sdpa` and `eager` and that the two implementations agree with each
+other. The explicit mask leaves the fp32 results unchanged (the fp32 equivalence above was measured
+with it) and changes the bf16 rounding, since a different kernel runs.
 
 ## Accuracy sanity
 
-`ask` over the whole test split, grouped by context (8000 rows in 6936 groups, dataset noul rows asked
-with their own question text so the prompts are the training ones), scored with `rlcd.eval.summarize`
-like `runs/q-rlcd/eval/metrics.json`, bf16 autocast in both:
+`ask` with the fp32 body over the whole test split, grouped by context (8000 rows in 6936 groups; the
+1333 noul rows go through `NoulQ`, which renders their questions verbatim), scored with
+`rlcd.eval.summarize` like `runs/q-rlcd/eval/metrics.json` (which was computed under bf16 autocast):
 
-| | ask | eval | diff |
+| | ask (fp32) | eval (bf16) | diff |
 |---|---|---|---|
-| accuracy | 0.8071 | 0.8074 | -0.0002 |
-| ECE (15 bins) | 0.0219 | 0.0214 | +0.0005 |
-| Brier loss | 0.2682 | 0.2682 | 0.0000 |
+| accuracy | 0.8080 | 0.8074 | +0.0006 |
+| ECE (15 bins) | 0.0210 | 0.0214 | -0.0004 |
+| Brier loss | 0.2683 | 0.2682 | +0.0001 |
 
-Both within the 0.002 bound. The residual is the bf16 noise described above: the same check run before
-the prefill switched attention kernels (see Latency) gave 0.8080 and 0.0209, so the third and fourth
-digits move with the kernels, which is also why an evaluation number should be quoted with its
-bootstrap interval rather than to four digits.
+Both within the 0.002 bound. The residual is the bf16 rounding of the eval itself (see above): an
+earlier run of this check under bf16 gave 0.8071 and 0.0219, so the third and fourth digits move with
+the kernels, which is also why an evaluation number should be quoted with its bootstrap interval
+rather than to four digits.
 
 ## The decision-only export
 
@@ -217,8 +248,13 @@ weight except the language-model head), the tokenizer, `decision_head.safetensor
 rows of the output head, `decision.json` (letters and their token ids, the prompt template pieces, the
 primitive and confidence definitions, the base model id, the training summary from `meta.json`, and
 the note below) and a `README.md` stub. `Decider.load` recognises the directory by its `decision.json`
-and loads it strictly: every tensor must match, the tokenizer must still give the recorded letter ids
-and BOS behaviour, and the loaded model must be a body without an output head.
+and loads it strictly: `decision.json` records the sha256 of `model.safetensors` and
+`decision_head.safetensors` and both are verified before anything runs, every tensor must match, the
+tokenizer must still give the recorded letter ids and BOS behaviour, and the loaded model must be a
+body without an output head. Loading the tokenizer prints a transformers 4.57 warning about an
+"incorrect regex pattern" and `fix_mistral_regex`; it is spurious for this tokenizer (it is not a
+Mistral tokenizer), and the encodings are unaffected and are the ones the model was trained on. The
+README stub says the same.
 
 The export of `runs/q-rlcd` is 2400 MB: `model.safetensors` 2384.2 MB (the body in fp32; the
 embedding, which is also the tied head, stays because the body needs it as its input embedding),
@@ -227,7 +263,8 @@ embedding, which is also the tied head, stays because the body needs it as its i
 `special_tokens_map.json`, `added_tokens.json` and the `chat_template.jinja` the tokenizer carries.
 `tests/test_export.py` exports a tiny untied model and checks that the export's `ask` output equals
 the original policy's, that the head rows equal the original `lm_head` rows, that no `lm_head` tensor
-is saved, that a LoRA adapter is refused, and that a tampered `decision.json` is refused on load.
+is saved, that a LoRA adapter is refused, and that a tampered `decision.json` or a flipped byte in
+either weight file is refused on load.
 
 `scripts/demo_decide.py` runs one ticket and three questions (department choice, priority score,
 page-on-call noul) on the export and prints the JSON answers.

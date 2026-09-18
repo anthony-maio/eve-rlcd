@@ -1,6 +1,7 @@
-"""Latency of ask() against ask_sequential() on one GPU, bf16 autocast, medians of 7 runs after 2
-warmups: (a) 1..64 questions against one 800-token state, (b) state length 200, 800, 1500 tokens
-at 8 questions, (c) option count 2, 5, 10, 26 at 8 questions.
+"""Latency of ask() against ask_sequential() on one GPU, with the body in fp32 (the default) and
+under bf16 autocast (fast=True), medians of 7 runs after 2 warmups: (a) 1..64 questions against one
+800-token state, (b) state length 200, 800, 1500 tokens at 8 questions, (c) option count 2, 5, 10, 26
+at 8 questions.
 
 Writes <out>/latency.json, <out>/latency.md and <out>/latency.png.
 
@@ -23,6 +24,8 @@ from rlcd.decide import ChoiceQ, Decider
 STATE_TOKENS = (200, 800, 1500)
 QUESTION_COUNTS = (1, 2, 4, 8, 16, 32, 64)
 OPTION_COUNTS = (2, 5, 10, 26)
+COLUMNS = ("ask_fp32_ms", "ask_fast_ms", "sequential_fp32_ms", "sequential_fast_ms")
+HEADERS = ("ask fp32", "ask fast", "sequential fp32", "sequential fast")
 
 
 def make_state(tok, n_tokens: int, seed: int = 0) -> str:
@@ -63,48 +66,60 @@ def timed(fn, warmups: int = 2, runs: int = 7) -> float:
     return statistics.median(times) * 1000.0
 
 
+def measure(decider: Decider, state: str, qs: list[ChoiceQ]) -> dict:
+    return {"ask_fp32_ms": timed(lambda: decider.ask(state, qs, fast=False)),
+            "ask_fast_ms": timed(lambda: decider.ask(state, qs, fast=True)),
+            "sequential_fp32_ms": timed(lambda: decider.ask_sequential(state, qs, fast=False)),
+            "sequential_fast_ms": timed(lambda: decider.ask_sequential(state, qs, fast=True))}
+
+
+def _line(label: str, r: dict) -> str:
+    cells = "   ".join(f"{h} {r[c]:7.1f}" for h, c in zip(HEADERS, COLUMNS))
+    return f"{label:<24} {cells} ms   speedup fp32 {r['sequential_fp32_ms'] / r['ask_fp32_ms']:.2f}x"
+
+
 def bench(decider: Decider, tok) -> dict:
     results = {"questions": [], "state_tokens": [], "options": []}
     state = make_state(tok, 800)
     for m in QUESTION_COUNTS:
-        qs = make_questions(m, 4)
-        ask = timed(lambda: decider.ask(state, qs))
-        seq = timed(lambda: decider.ask_sequential(state, qs))
-        results["questions"].append({"m": m, "ask_ms": ask, "sequential_ms": seq})
-        print(f"M={m:<3} k=4  state=800   ask {ask:8.1f} ms   sequential {seq:8.1f} ms   speedup {seq / ask:5.2f}x")
+        r = {"m": m, **measure(decider, state, make_questions(m, 4))}
+        results["questions"].append(r)
+        print(_line(f"M={m} k=4 state=800", r))
     qs = make_questions(8, 4)
     for n in STATE_TOKENS:
-        s = make_state(tok, n)
-        ask = timed(lambda: decider.ask(s, qs))
-        seq = timed(lambda: decider.ask_sequential(s, qs))
-        results["state_tokens"].append({"state_tokens": n, "ask_ms": ask, "sequential_ms": seq})
-        print(f"M=8   k=4  state={n:<5} ask {ask:8.1f} ms   sequential {seq:8.1f} ms   speedup {seq / ask:5.2f}x")
+        r = {"state_tokens": n, **measure(decider, make_state(tok, n), qs)}
+        results["state_tokens"].append(r)
+        print(_line(f"M=8 k=4 state={n}", r))
     for k in OPTION_COUNTS:
-        qs = make_questions(8, k)
-        ask = timed(lambda: decider.ask(state, qs))
-        seq = timed(lambda: decider.ask_sequential(state, qs))
-        results["options"].append({"k": k, "ask_ms": ask, "sequential_ms": seq})
-        print(f"M=8   k={k:<2} state=800   ask {ask:8.1f} ms   sequential {seq:8.1f} ms   speedup {seq / ask:5.2f}x")
+        r = {"k": k, **measure(decider, state, make_questions(8, k))}
+        results["options"].append(r)
+        print(_line(f"M=8 k={k} state=800", r))
     return results
 
 
+def _table(rows: list[dict], xkey: str, xlabel: str) -> list[str]:
+    lines = [f"| {xlabel} | " + " | ".join(f"{h} (ms)" for h in HEADERS) + " | speedup fp32 | speedup fast |",
+             "|---" * 7 + "|"]
+    for r in rows:
+        lines.append(f"| {r[xkey]} | " + " | ".join(f"{r[c]:.1f}" for c in COLUMNS)
+                     + f" | {r['sequential_fp32_ms'] / r['ask_fp32_ms']:.2f}x"
+                     + f" | {r['sequential_fast_ms'] / r['ask_fast_ms']:.2f}x |")
+    return lines
+
+
 def table(results: dict, device: str) -> str:
-    lines = [f"Latency of the decision API on {device}, bf16 autocast, fp32 head. Medians of 7 runs after 2 warmups, "
-             "in milliseconds. ask: one prefill of the state, one batched forward over the question suffixes. "
-             "sequential: every full prompt through the training-time path, right-padded in batches of 32.", ""]
-    lines += ["**(a) question count, one 800-token state, 4 options each**", "",
-              "| questions | ask (ms) | sequential (ms) | speedup |", "|---|---|---|---|"]
-    for r in results["questions"]:
-        lines.append(f"| {r['m']} | {r['ask_ms']:.1f} | {r['sequential_ms']:.1f} | {r['sequential_ms'] / r['ask_ms']:.2f}x |")
-    lines += ["", "**(b) state length, 8 questions, 4 options each**", "",
-              "| state tokens | ask (ms) | sequential (ms) | speedup |", "|---|---|---|---|"]
-    for r in results["state_tokens"]:
-        lines.append(f"| {r['state_tokens']} | {r['ask_ms']:.1f} | {r['sequential_ms']:.1f} | "
-                     f"{r['sequential_ms'] / r['ask_ms']:.2f}x |")
-    lines += ["", "**(c) option count, 8 questions, one 800-token state**", "",
-              "| options | ask (ms) | sequential (ms) | speedup |", "|---|---|---|---|"]
-    for r in results["options"]:
-        lines.append(f"| {r['k']} | {r['ask_ms']:.1f} | {r['sequential_ms']:.1f} | {r['sequential_ms'] / r['ask_ms']:.2f}x |")
+    lines = [f"Latency of the decision API on {device}. Medians of 7 runs after 2 warmups, in milliseconds. "
+             "ask: one prefill of the state, one batched forward over the question suffixes. sequential: every "
+             "full prompt through the training-time path, right-padded in batches of 32. fp32: the body in fp32 "
+             "(the default, exact against the training-time path). fast: the body under bf16 autocast "
+             "(fast=True). The decision head is fp32 in every column. speedup fp32 is sequential fp32 over ask "
+             "fp32; speedup fast is sequential fast over ask fast.", ""]
+    lines += ["**(a) question count, one 800-token state, 4 options each**", ""]
+    lines += _table(results["questions"], "m", "questions")
+    lines += ["", "**(b) state length, 8 questions, 4 options each**", ""]
+    lines += _table(results["state_tokens"], "state_tokens", "state tokens")
+    lines += ["", "**(c) option count, 8 questions, one 800-token state**", ""]
+    lines += _table(results["options"], "k", "options")
     return "\n".join(lines) + "\n"
 
 
@@ -116,11 +131,15 @@ def plot(results: dict, out_png: Path) -> None:
     panels = [("questions", "m", "questions (one 800-token state, 4 options)"),
               ("state_tokens", "state_tokens", "state tokens (8 questions, 4 options)"),
               ("options", "k", "options per question (8 questions, 800-token state)")]
+    styles = [("ask_fp32_ms", "ask, fp32 body", "#2a78d6", "o", "-"),
+              ("ask_fast_ms", "ask, fast (bf16)", "#2a78d6", "o", "--"),
+              ("sequential_fp32_ms", "sequential, fp32 body", "#e34948", "s", "-"),
+              ("sequential_fast_ms", "sequential, fast (bf16)", "#e34948", "s", "--")]
     for ax, (key, xkey, label) in zip(axes, panels):
         rows = results[key]
         x = [r[xkey] for r in rows]
-        ax.plot(x, [r["ask_ms"] for r in rows], marker="o", color="#2a78d6", label="ask (shared prefix)")
-        ax.plot(x, [r["sequential_ms"] for r in rows], marker="s", color="#e34948", label="sequential (full prompts)")
+        for col, name, color, marker, ls in styles:
+            ax.plot(x, [r[col] for r in rows], marker=marker, color=color, linestyle=ls, label=name)
         ax.set_xlabel(label)
         ax.set_ylabel("latency (ms, median of 7)")
         ax.set_ylim(bottom=0)

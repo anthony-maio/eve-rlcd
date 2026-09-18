@@ -16,7 +16,7 @@ QUESTIONS = [
     ChoiceQ("Which department should handle this ticket?",
             ["BILLING", "INFRASTRUCTURE", "SECURITY", "PRODUCT_SUPPORT"]),
     ScoreQ("What is the priority of this ticket?", ["P3_LOW", "P2_NORMAL", "P1_HIGH", "P0_CRITICAL"]),
-    NoulQ("an on-call engineer should be paged immediately"),
+    NoulQ("Should an on-call engineer be paged immediately?"),
 ]
 
 

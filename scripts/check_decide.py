@@ -4,7 +4,8 @@
    ask_sequential() (every full prompt through the training-time path), in bf16 autocast and with
    the body in fp32, with 1, 5 and 20 unrelated questions from other rows mixed in.
 2. Independence: a question's probabilities when other questions are added, removed or reordered.
-3. Accuracy sanity: ask() over the whole test split, grouped by context, scored like rlcd.eval.
+3. Accuracy sanity: ask() over the whole test split, grouped by context, scored like rlcd.eval
+   (body in fp32 by default; --accuracy-fast for bf16 autocast, which is what the eval used).
 
 Writes <out>/equivalence.json and <out>/preds_ask.jsonl. Exit status 1 when a stated tolerance
 fails; every measured maximum is printed either way.
@@ -30,14 +31,12 @@ from rlcd.schema import NOTA, Question, read_jsonl
 TOL = {"bf16": 1e-4, "fp32": 1e-5}
 
 
-def to_primitive(q: Question, keep_noul_text: bool = False):
-    """The primitive a dataset row stands for. Dataset noul rows carry their own question text
-    (NoulQ renders "Is this true: ..."), so keep_noul_text asks them as a true/false choice to
-    reproduce the training prompt verbatim; the probabilities do not depend on the kind."""
+def to_primitive(q: Question):
+    """The primitive a dataset row stands for; each renders the row's prompt verbatim."""
     if q.primitive == "score":
         return ScoreQ(q.question, q.choices)
-    if q.primitive == "noul" and not keep_noul_text:
-        return NoulQ(q.question.rstrip("?"))
+    if q.primitive == "noul":
+        return NoulQ(q.question)
     return ChoiceQ(q.question, q.choices)
 
 
@@ -124,9 +123,9 @@ def check_against_fp32(decider: Decider, chosen: list[list[Question]]) -> dict:
     for g in chosen:
         state = g[0].context
         prims = [to_primitive(q) for q in g]
-        decider.autocast = False
+        decider.fast = False
         truth = first_k(torch.softmax(decider.logits_sequential(state, prims), -1), g)
-        decider.autocast = True
+        decider.fast = True
         ask = first_k(decider.probs(state, prims), g)
         seq = first_k(torch.softmax(decider.logits_sequential(state, prims), -1), g)
         diffs.add("ask_bf16_vs_sequential_fp32", ask, truth)
@@ -163,7 +162,7 @@ def check_accuracy(decider: Decider, groups: list[list[Question]], out: Path) ->
     preds = []
     t0 = time.perf_counter()
     for g in groups:
-        probs = decider.logits(g[0].context, [to_primitive(q, keep_noul_text=True) for q in g])
+        probs = decider.logits(g[0].context, [to_primitive(q) for q in g])
         for q, row in zip(g, probs.cpu()):
             preds.append({"id": q.id, "source": q.source, "primitive": q.primitive, "k": q.k, "answer": q.answer,
                           "logits": row[: q.k].tolist(), "nota_index": q.choices.index(NOTA) if NOTA in q.choices else -1})
@@ -184,6 +183,8 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--skip-accuracy", action="store_true")
+    ap.add_argument("--accuracy-fast", action="store_true",
+                    help="run the accuracy sanity under bf16 autocast (the eval's setting) instead of fp32")
     args = ap.parse_args(argv)
 
     out = Path(args.out)
@@ -206,7 +207,7 @@ def main(argv=None):
           f"the split after the blank line{' ' + str(split['failed_after_blank_line'][:5]) if failed else ''}; "
           f"{split['failed_before_last_newline']} rows differ with the fallback split before the last newline")
     for mode in ("bf16", "fp32"):
-        decider.autocast = mode == "bf16"
+        decider.fast = mode == "bf16"
         t0 = time.perf_counter()
         worst = check_equivalence(decider, chosen, rows, (1, 5, 20), args.seed)
         worst["seconds"] = time.perf_counter() - t0
@@ -220,10 +221,11 @@ def main(argv=None):
     report["bf16_error_budget"] = check_against_fp32(decider, chosen)
     print("\n[bf16 against the fp32 single pass]")
     show(report["bf16_error_budget"])
-    decider.autocast = True
+    decider.fast = args.accuracy_fast
 
     if not args.skip_accuracy:
         acc = check_accuracy(decider, groups, out)
+        acc["fast"] = args.accuracy_fast
         metrics_path = Path(args.metrics) if args.metrics else Path(args.model) / "eval" / "metrics.json"
         want = json.loads(metrics_path.read_text())["overall"]
         acc["reference"] = {"acc": want["acc"], "ece": want["ece"], "brier": want["brier"], "path": str(metrics_path)}
@@ -233,8 +235,8 @@ def main(argv=None):
         report["accuracy"] = acc
         report["passed"]["accuracy"] = ok
         failed |= not ok
-        print(f"\n[accuracy] ask over {acc['n']} rows in {acc['groups']} groups, {acc['seconds']:.0f} s: "
-              f"{'PASS' if ok else 'FAIL'}")
+        print(f"\n[accuracy] ask ({'bf16 autocast' if args.accuracy_fast else 'fp32 body'}) over {acc['n']} rows "
+              f"in {acc['groups']} groups, {acc['seconds']:.0f} s: {'PASS' if ok else 'FAIL'}")
         print(f"  acc {acc['acc']:.4f} (eval {want['acc']:.4f}, diff {acc['acc_diff']:+.4f})")
         print(f"  ece {acc['ece']:.4f} (eval {want['ece']:.4f}, diff {acc['ece_diff']:+.4f})")
         print(f"  brier {acc['brier']:.4f} (eval {want['brier']:.4f})")
