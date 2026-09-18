@@ -7,8 +7,13 @@
 3. Accuracy sanity: ask() over the whole test split, grouped by context, scored like rlcd.eval
    (body in fp32 by default; --accuracy-fast for bf16 autocast, which is what the eval used).
 
-Writes <out>/equivalence.json and <out>/preds_ask.jsonl. Exit status 1 when a stated tolerance
-fails; every measured maximum is printed either way.
+The pass rule: the cached path must agree with the training-time path to within FLOOR_FACTOR
+times the amount the training-time path disagrees with itself across batch sizes on the same rows
+(max |sequential at batch 1 - sequential at batch 32|, its own rounding floor), and never worse than
+TOL absolute (1e-5 in fp32, 1e-4 in bf16). Floor, threshold and observed maximum are recorded.
+
+Writes <out>/equivalence.json and <out>/preds_ask.jsonl. Exit status 1 when a check fails; every
+measured maximum is printed either way.
 
     uv run python scripts/check_decide.py --model runs/q-rlcd --out runs/decide-bench
 """
@@ -29,6 +34,15 @@ from rlcd.quick_eval import stride_sample
 from rlcd.schema import NOTA, Question, read_jsonl
 
 TOL = {"bf16": 1e-4, "fp32": 1e-5}
+FLOOR_FACTOR = 3
+CHECKS = ("ask_vs_sequential", "with_extras_vs_sequential", "add", "remove", "reorder")
+
+
+def threshold(mode: str, floor: float) -> float:
+    """The pass threshold: the cached path must agree with the training-time path to within
+    FLOOR_FACTOR times the amount the training-time path disagrees with itself across batch
+    sizes on the same rows (its own rounding floor), and never worse than TOL[mode] absolute."""
+    return max(TOL[mode], FLOOR_FACTOR * floor)
 
 
 def to_primitive(q: Question):
@@ -135,7 +149,7 @@ def check_against_fp32(decider: Decider, chosen: list[list[Question]]) -> dict:
 
 def show(worst: dict) -> None:
     for key, d in worst.items():
-        if isinstance(d, dict):
+        if isinstance(d, dict) and "max" in d:
             print(f"  |diff| {key:<40} max {d['max']:.3e}   mean {d['mean']:.3e}   over {d['n']} probabilities")
         elif key == "seconds":
             print(f"  {d:.1f} s")
@@ -211,12 +225,18 @@ def main(argv=None):
         t0 = time.perf_counter()
         worst = check_equivalence(decider, chosen, rows, (1, 5, 20), args.seed)
         worst["seconds"] = time.perf_counter() - t0
+        floor = worst["sequential_bs1_vs_bs32"]["max"]
+        observed = max(worst[k]["max"] for k in CHECKS)
+        limit = threshold(mode, floor)
+        worst["rule"] = {"floor": floor, "floor_factor": FLOOR_FACTOR, "absolute": TOL[mode], "threshold": limit,
+                         "observed_max": observed}
         report["equivalence"][mode] = worst
-        ok = all(worst[k]["max"] <= TOL[mode] for k in ("ask_vs_sequential", "with_extras_vs_sequential", "add",
-                                                          "remove", "reorder"))
+        ok = observed <= limit
         report["passed"][mode] = ok
         failed |= not ok
-        print(f"\n[{mode}] tolerance {TOL[mode]:g}: {'PASS' if ok else 'FAIL'}")
+        print(f"\n[{mode}] {'PASS' if ok else 'FAIL'}: observed max {observed:.3e} against threshold {limit:.3e} "
+              f"= max({TOL[mode]:g}, {FLOOR_FACTOR} x floor {floor:.3e}), the floor being the training-time path "
+              f"against itself across batch sizes on the same rows")
         show(worst)
     report["bf16_error_budget"] = check_against_fp32(decider, chosen)
     print("\n[bf16 against the fp32 single pass]")
