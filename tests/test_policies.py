@@ -609,6 +609,61 @@ def test_local_custom_code_is_trusted_only_when_it_hashes_to_the_reviewed_file(t
         remote_code_kwargs(tok_dir, origin="fake/pinned")
 
 
+def test_remote_code_kwargs_reach_only_the_masked_lm_backend(tmp_path, monkeypatch, gpt2_tok, mask_tok):
+    import hashlib
+
+    import rlcd.policies as policies
+    from transformers import AutoModelForCausalLM, AutoModelForMaskedLM
+    genuine = "import torch\n"
+    pin = policies.PinnedCode("b" * 40, {"modeling_fake.py": hashlib.sha256(genuine.encode()).hexdigest()})
+    monkeypatch.setattr(policies, "PINNED_REMOTE_CODE", {"fake/pinned": pin})
+    monkeypatch.setattr(policies, "_ENCODER_CODE_LOADED", False)
+    seen: dict[str, dict] = {}
+
+    def fake(builder, tag):
+        def from_pretrained(name, **kwargs):
+            seen[tag] = kwargs
+            info = {"missing_keys": [], "unexpected_keys": [], "mismatched_keys": [], "error_msgs": []}
+            return (builder(), info) if kwargs.get("output_loading_info") else builder()
+        return from_pretrained
+
+    monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", fake(tiny_llama, "decoder"))
+    monkeypatch.setattr(AutoModelForMaskedLM, "from_pretrained", fake(lambda: tiny_bert(len(mask_tok)), "mlm"))
+    tok_calls = []
+    monkeypatch.setattr(policies, "_load_tokenizer",
+                        lambda name, **kw: tok_calls.append(kw) or (mask_tok if "mlm" in name else gpt2_tok))
+    for backend in ("hf-decoder", "hf-mlm"):
+        d = _custom_code_dir(tmp_path / backend, genuine, {"AutoModelForMaskedLM": "modeling_fake.FakeModel"})
+        (tmp_path / backend / "policy.json").write_text(json.dumps({"backend": backend, "lora": False,
+                                                                     "origin": "fake/pinned"}))
+        load_policy(d, device="cpu")
+    assert "trust_remote_code" not in seen["decoder"] and "code_revision" not in seen["decoder"]
+    assert seen["mlm"]["trust_remote_code"] is True and seen["mlm"]["code_revision"] == "b" * 40
+    assert tok_calls == [{}, {"trust_remote_code": True, "code_revision": "b" * 40}]
+
+
+def test_auto_backend_picks_hf_mlm_for_a_masked_lm_only_auto_map(tmp_path):
+    mlm_only = tmp_path / "mlm-only"
+    mlm_only.mkdir()
+    (mlm_only / "config.json").write_text(json.dumps({"model_type": "lfm2", "auto_map": {
+        "AutoModel": "modeling_x.XModel", "AutoModelForMaskedLM": "modeling_x.XForMaskedLM"}}))
+    assert resolve_backend(str(mlm_only), "auto") == "hf-mlm"
+    both = tmp_path / "both"
+    both.mkdir()
+    (both / "config.json").write_text(json.dumps({"model_type": "lfm2", "auto_map": {
+        "AutoModelForCausalLM": "modeling_x.XForCausalLM", "AutoModelForMaskedLM": "modeling_x.XForMaskedLM"}}))
+    assert resolve_backend(str(both), "auto") == "hf-decoder"
+    # An explicit backend and a policy.json still win.
+    assert resolve_backend(str(mlm_only), "hf-decoder") == "hf-decoder"
+    (mlm_only / "policy.json").write_text(json.dumps({"backend": "hf-decoder"}))
+    assert resolve_backend(str(mlm_only), "auto") == "hf-decoder"
+
+
+@pytest.mark.network
+def test_auto_backend_picks_hf_mlm_for_the_pinned_encoder_id():
+    assert resolve_backend("LiquidAI/LFM2.5-Encoder-350M", "auto") == "hf-mlm"
+
+
 def test_loading_a_tampered_local_checkpoint_of_a_pinned_base_is_refused(tmp_path, monkeypatch):
     import rlcd.policies as policies
     from rlcd.policies import PinnedCode

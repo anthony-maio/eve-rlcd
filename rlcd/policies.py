@@ -380,9 +380,23 @@ def _read_record(path_or_id: str) -> dict:
     return _read_json(os.path.join(path_or_id, POLICY_FILE))
 
 
+def _config_dict(path_or_id: str) -> dict:
+    """config.json of a local directory, or of a pinned hub repo at its pinned commit (the only
+    hub repos whose custom-code auto_map matters, and cached after the first fetch). Anything
+    else is {} rather than a network round trip."""
+    if os.path.isdir(path_or_id):
+        return _read_json(os.path.join(path_or_id, "config.json"))
+    if path_or_id in PINNED_REMOTE_CODE:
+        from huggingface_hub import hf_hub_download
+        return _read_json(hf_hub_download(path_or_id, "config.json",
+                                          revision=PINNED_REMOTE_CODE[path_or_id].revision))
+    return {}
+
+
 def resolve_backend(path_or_id: str, backend: str = "auto") -> str:
-    """auto: what a local policy.json records, else eve for the Eve hub id or an Eve
-    config.json, else hf-decoder."""
+    """auto: what a local policy.json records, else eve for the Eve hub id or an Eve config.json,
+    else hf-mlm for a config whose custom-code auto_map offers a masked LM and no causal LM,
+    else hf-decoder."""
     path_or_id = os.fspath(path_or_id)
     if backend != "auto":
         if backend not in BACKENDS:
@@ -393,11 +407,12 @@ def resolve_backend(path_or_id: str, backend: str = "auto") -> str:
         return resolve_backend(path_or_id, record["backend"])
     if path_or_id == EVE_ID:
         return "eve"
-    config = os.path.join(path_or_id, "config.json")
-    if os.path.isfile(config):
-        with open(config, encoding="utf-8") as f:
-            if json.load(f).get("model_type") == "eve-moe":
-                return "eve"
+    config = _config_dict(path_or_id)
+    if config.get("model_type") == "eve-moe":
+        return "eve"
+    auto_map = config.get("auto_map") or {}
+    if "AutoModelForMaskedLM" in auto_map and "AutoModelForCausalLM" not in auto_map:
+        return "hf-mlm"
     return "hf-decoder"
 
 
@@ -480,8 +495,11 @@ def _load_hf(policy_cls, auto_cls, path_or_id: str, device: str, lora: bool, gra
     record = _read_record(path_or_id)
     saved_adapter = bool(record.get("lora"))
     weights, origin, revision = _lineage(path_or_id, record)
-    tok_kwargs = remote_code_kwargs(path_or_id, origin)
-    kwargs = remote_code_kwargs(weights, origin)
+    # Custom code is only ever enabled for the pinned encoder, so only the hf-mlm backend may
+    # ask for it; a decoder from the same lineage would run its stock transformers class.
+    custom = policy_cls is HFMaskedLMPolicy
+    tok_kwargs = remote_code_kwargs(path_or_id, origin) if custom else {}
+    kwargs = remote_code_kwargs(weights, origin) if custom else {}
     if revision is not None:
         if kwargs.get("revision", revision) != revision:
             raise RuntimeError(f"{path_or_id} was trained on {weights} at {revision}, but the pinned "
