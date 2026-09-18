@@ -17,13 +17,15 @@ def qwen_tok():
     return AutoTokenizer.from_pretrained(QWEN)
 
 
-def tiny_qwen3():
+def tiny_qwen3(attn_implementation: str = "sdpa"):
     from transformers import Qwen3Config, Qwen3ForCausalLM
     torch.manual_seed(0)
     cfg = Qwen3Config(vocab_size=151936, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
                       num_attention_heads=2, num_key_value_heads=1, head_dim=16, max_position_embeddings=4096,
-                      tie_word_embeddings=True)
-    return Qwen3ForCausalLM(cfg).eval()
+                      tie_word_embeddings=True, attn_implementation=attn_implementation)
+    model = Qwen3ForCausalLM(cfg).eval()
+    assert model.config._attn_implementation == attn_implementation
+    return model
 
 
 def tiny_llama():
@@ -39,7 +41,7 @@ STATE = ("Ticket #4111 from a startup plan customer. Report: cannot find the set
 QUESTIONS = [ChoiceQ("Which department should handle this ticket?",
                      ["BILLING", "INFRASTRUCTURE", "SECURITY", "PRODUCT_SUPPORT"]),
              ScoreQ("What is the priority of this ticket?", ["P3_LOW", "P2_NORMAL", "P1_HIGH", "P0_CRITICAL"]),
-             NoulQ("an on-call engineer should be paged immediately"),
+             NoulQ("Should an on-call engineer be paged immediately?"),
              ChoiceQ("Pick a letter", [f"option {j}" for j in range(26)])]
 
 
@@ -57,7 +59,9 @@ def test_primitives_become_validated_questions():
     assert q.primitive == "score" and q.ordered is True and q.choices == QUESTIONS[1].levels
     q = to_question("s", QUESTIONS[2])
     assert q.primitive == "noul" and q.choices == ["true", "false"]
-    assert q.question == "Is this true: an on-call engineer should be paged immediately"
+    assert q.question == "Should an on-call engineer be paged immediately?"  # verbatim, as trained
+    assert render_suffix(q).startswith("Question: Should an on-call engineer be paged immediately?\n"
+                                       "Options:\nA) true\nB) false\n")
     with pytest.raises(ValueError, match="need 2"):
         to_question("s", ChoiceQ("q", ["only"]))
     with pytest.raises(ValueError, match="need 2"):
@@ -189,6 +193,18 @@ def test_ask_matches_the_single_pass_path_and_is_independent_of_the_batch(decide
     _assert_same(extra[:4], ref, 1e-5)
 
 
+@pytest.mark.parametrize("attn", ["sdpa", "eager"])
+def test_ask_matches_the_single_pass_under_each_attention_implementation(qwen_tok, attn):
+    """The prefill passes its own causal mask. sdpa takes a boolean mask and eager adds the
+    mask to the scores, so the mask has to be one both implementations read as causal."""
+    d = Decider(HFDecoderPolicy(tiny_qwen3(attn), qwen_tok), device="cpu")
+    assert d.policy.model.config._attn_implementation == attn
+    _assert_same(d.ask(STATE, QUESTIONS), d.ask_sequential(STATE, QUESTIONS), 1e-5)
+    # The two implementations agree with each other too, so neither path is accidentally acausal.
+    other = Decider(HFDecoderPolicy(tiny_qwen3("eager" if attn == "sdpa" else "sdpa"), qwen_tok), device="cpu")
+    _assert_same(d.ask(STATE, QUESTIONS), other.ask(STATE, QUESTIONS), 1e-5)
+
+
 def test_ask_on_a_llama_body_and_with_bos(qwen_tok):
     d = Decider(HFDecoderPolicy(tiny_llama(), qwen_tok), device="cpu")
     _assert_same(d.ask(STATE, QUESTIONS), d.ask_sequential(STATE, QUESTIONS), 1e-5)
@@ -225,7 +241,11 @@ def test_load_from_a_saved_checkpoint(tmp_path, qwen_tok):
     policy.save(str(tmp_path / "ckpt"), {"steps": 1})
     d = Decider.load(str(tmp_path / "ckpt"), device="cpu")
     assert isinstance(d.policy, HFDecoderPolicy) and not d.policy.model.training
-    assert d.autocast is False  # cpu never autocasts
+    assert d.fast is False  # exact by default; fast is bf16 autocast and needs CUDA
+    with pytest.raises(ValueError, match="CUDA"):
+        d.ask(STATE, QUESTIONS, fast=True)
+    with pytest.raises(ValueError, match="CUDA"):
+        Decider(policy, device="cpu", fast=True).ask(STATE, QUESTIONS)
     ref = Decider(policy, device="cpu").ask(STATE, QUESTIONS)
     _assert_same(d.ask(STATE, QUESTIONS), ref, 1e-6)
 

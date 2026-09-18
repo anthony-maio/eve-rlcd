@@ -26,7 +26,7 @@ from rlcd.schema import Question, render_prefix, render_suffix
 
 PREFIX_HEADER = "User: Context:\n"
 PREFIX_TAIL = "\n\n"
-NOUL_TEMPLATE = "Is this true: {proposition}"
+NOUL_OPTIONS = ("true", "false")
 
 # Our own confidence definitions; the metrics module computes them for evaluation.
 CONFIDENCE_DEFINITIONS = {
@@ -56,9 +56,10 @@ class ScoreQ:
 
 @dataclass
 class NoulQ:
-    """A proposition judged true or false; rendered as the question
-    "Is this true: <proposition>" with the options true and false."""
-    proposition: str
+    """A yes/no question, rendered verbatim with the options true and false, exactly as a
+    dataset noul row is rendered (for example "Should an on-call engineer be paged
+    immediately?")."""
+    question: str
 
 
 Primitive = ChoiceQ | ScoreQ | NoulQ
@@ -71,8 +72,7 @@ def to_question(state: str, q: Primitive) -> Question:
     if isinstance(q, ScoreQ):
         return Question("score", state, q.question, list(q.levels), ordered=True).validate()
     if isinstance(q, NoulQ):
-        return Question("noul", state, NOUL_TEMPLATE.format(proposition=q.proposition.strip()),
-                        ["true", "false"]).validate()
+        return Question("noul", state, q.question, list(NOUL_OPTIONS)).validate()
     raise TypeError(f"expected a ChoiceQ, ScoreQ or NoulQ, got {type(q).__name__}")
 
 
@@ -133,32 +133,34 @@ class SharedPrefixCache(DynamicCache):
 # ---------- the decider ----------
 
 class Decider:
-    def __init__(self, policy: HFDecoderPolicy, device: str | None = None, autocast: bool | None = None):
+    def __init__(self, policy: HFDecoderPolicy, device: str | None = None, fast: bool = False):
         """policy: an hf-decoder policy, put in eval mode. device: where its model lives
-        (defaulting to the device of its parameters). autocast: run the body under bf16
-        autocast; the default is yes on CUDA and no elsewhere. The decision head always
-        runs in fp32."""
+        (defaulting to the device of its parameters). fast: run the body under bf16 autocast
+        by default. Off, the body runs in fp32 and ask agrees with the training-time path to
+        about 1e-6; on (CUDA only), it is faster at large question counts and agrees to about
+        1e-2 at the worst probability, the bf16 noise of the training-time path itself. Every
+        ask call can override it. The decision head always runs in fp32."""
         if not isinstance(policy, HFDecoderPolicy):
             raise TypeError(f"Decider needs an hf-decoder policy, got {type(policy).__name__}")
         self.policy = policy.eval()
         self.tok = policy.tok
         self.device = device or str(next(policy.model.parameters()).device)
         self.device_type = torch.device(self.device).type
-        self.autocast = (self.device_type == "cuda") if autocast is None else autocast
+        self.fast = fast
         check_split(self.tok)
 
     @classmethod
-    def load(cls, path_or_id: str, device: str = "cuda") -> "Decider":
+    def load(cls, path_or_id: str, device: str = "cuda", fast: bool = False) -> "Decider":
         """A decider over a checkpoint written by Policy.save, or over a decision-only export
         (a directory with decision.json)."""
         path_or_id = os.fspath(path_or_id)
         if os.path.isfile(os.path.join(path_or_id, "decision.json")):
             from rlcd.export import load_decision_only
-            return cls(load_decision_only(path_or_id, device), device)
+            return cls(load_decision_only(path_or_id, device), device, fast)
         policy = load_policy(path_or_id, device=device)
         if not isinstance(policy, HFDecoderPolicy):
             raise TypeError(f"{path_or_id} is a {policy.name} policy; Decider supports hf-decoder only")
-        return cls(policy, device)
+        return cls(policy, device, fast)
 
     # ----- rendering and truncation -----
 
@@ -212,21 +214,37 @@ class Decider:
 
     # ----- the cached-prefix path -----
 
-    def _autocast(self):
-        return torch.autocast(self.device_type, dtype=torch.bfloat16, enabled=self.autocast)
+    def _fast(self, fast: bool | None) -> bool:
+        fast = self.fast if fast is None else fast
+        if fast and self.device_type != "cuda":
+            raise ValueError("fast (bf16 autocast) needs a CUDA device")
+        return fast
 
-    def prefill(self, prefix: str) -> DynamicCache:
+    def _autocast(self, fast: bool):
+        return torch.autocast(self.device_type, dtype=torch.bfloat16, enabled=fast)
+
+    def _score_dtype(self, fast: bool) -> torch.dtype:
+        """The dtype of the attention scores: bf16 under autocast, else the weights' dtype."""
+        return torch.bfloat16 if fast else next(self.policy.model.parameters()).dtype
+
+    def prefill(self, prefix: str, fast: bool | None = None) -> DynamicCache:
         """The body's key/value cache over the prefix, at batch size 1. The causal mask is
-        passed explicitly as a 4D tensor: with no mask at all, the sdpa integration of
-        transformers 4.57 hands grouped-query attention to torch with enable_gqa, which falls
-        back to the unfused math kernel on builds without flash attention (this one); with a
-        mask it repeats the key/value heads and the fused kernel runs, several times faster on
-        a long state. The result is the same either way."""
+        passed explicitly, as an additive 4D mask in the dtype of the attention scores: sdpa
+        adds a float mask of the query's dtype to the scores and eager attention adds it as
+        well, so both implementations read it as causal (a boolean mask would be added as
+        0/1 by eager, and a mask of another dtype is refused by sdpa). It is passed at all
+        because with no mask the sdpa integration of transformers 4.57 hands grouped-query
+        attention to torch with enable_gqa, which falls back to the unfused math kernel on
+        builds without flash attention (this one); with a mask it repeats the key/value heads
+        and the fused kernel runs, several times faster on a long state."""
+        fast = self._fast(fast)
         ids = ([self.tok.bos_token_id] if self.policy.prepend_bos else []) + self._encode(prefix)
         ids = torch.tensor([ids], dtype=torch.long, device=self.device)
         n = ids.shape[1]
-        causal = torch.ones((1, 1, n, n), dtype=torch.bool, device=self.device).tril()
-        with torch.no_grad(), self._autocast():
+        dtype = self._score_dtype(fast)
+        blocked = ~torch.ones((1, 1, n, n), dtype=torch.bool, device=self.device).tril()
+        causal = torch.zeros((1, 1, n, n), dtype=dtype, device=self.device).masked_fill(blocked, torch.finfo(dtype).min)
+        with torch.no_grad(), self._autocast(fast):
             out = self.policy._body()(input_ids=ids, attention_mask=causal, use_cache=True)
         return out.past_key_values
 
@@ -243,9 +261,11 @@ class Decider:
             last[i] = len(s) - 1
         return ids.to(self.device), mask.to(self.device), last.to(self.device)
 
-    def logits_from_prefix(self, prefix: DynamicCache, qs: list[Question], batch_size: int = 32) -> torch.Tensor:
+    def logits_from_prefix(self, prefix: DynamicCache, qs: list[Question], batch_size: int = 32,
+                           fast: bool | None = None) -> torch.Tensor:
         """fp32 decision logits (M, 26), masked beyond each k, for the suffixes of qs over a
         prefilled prefix, in chunks of batch_size rows. The prefix cache is read, never changed."""
+        fast = self._fast(fast)
         prefix_len = prefix.get_seq_length()
         body = self.policy._body()
         chunks = []
@@ -256,7 +276,7 @@ class Decider:
                 m, width = ids.shape
                 full_mask = torch.cat([torch.ones((m, prefix_len), dtype=mask.dtype, device=mask.device), mask], 1)
                 cache_position = torch.arange(prefix_len, prefix_len + width, device=self.device)
-                with self._autocast():
+                with self._autocast(fast):
                     hidden = body(input_ids=ids, attention_mask=full_mask, position_ids=cache_position[None],
                                   past_key_values=SharedPrefixCache(prefix), use_cache=True,
                                   cache_position=cache_position).last_hidden_state
@@ -264,32 +284,35 @@ class Decider:
                 chunks.append(self.policy.logits_from_hidden(rows, [q.k for q in chunk]))
         return torch.cat(chunks) if chunks else torch.zeros((0, 26), dtype=torch.float32)
 
-    def probs_from_prefix(self, prefix: DynamicCache, qs: list[Question], batch_size: int = 32) -> torch.Tensor:
-        return torch.softmax(self.logits_from_prefix(prefix, qs, batch_size), -1)
+    def probs_from_prefix(self, prefix: DynamicCache, qs: list[Question], batch_size: int = 32,
+                          fast: bool | None = None) -> torch.Tensor:
+        return torch.softmax(self.logits_from_prefix(prefix, qs, batch_size, fast), -1)
 
     def logits(self, state: str, questions: list[Primitive], max_state_tokens: int = 1536,
-               max_question_tokens: int = 448, batch_size: int = 32) -> torch.Tensor:
+               max_question_tokens: int = 448, batch_size: int = 32, fast: bool | None = None) -> torch.Tensor:
         """The cached-prefix path: prefill once, one batched forward over the suffixes."""
         prefix, qs = self.render(state, questions, max_state_tokens, max_question_tokens)
         if not qs:
             return torch.zeros((0, 26), dtype=torch.float32)
-        return self.logits_from_prefix(self.prefill(prefix), qs, batch_size)
+        return self.logits_from_prefix(self.prefill(prefix, fast), qs, batch_size, fast)
 
     def probs(self, state, questions, max_state_tokens: int = 1536, max_question_tokens: int = 448,
-              batch_size: int = 32) -> torch.Tensor:
+              batch_size: int = 32, fast: bool | None = None) -> torch.Tensor:
         """fp32 probabilities (M, 26) over the letters; positions beyond k hold exactly 0."""
-        return torch.softmax(self.logits(state, questions, max_state_tokens, max_question_tokens, batch_size), -1)
+        return torch.softmax(self.logits(state, questions, max_state_tokens, max_question_tokens, batch_size, fast), -1)
 
     def ask(self, state: str, questions: list[Primitive], max_state_tokens: int = 1536,
-            max_question_tokens: int = 448, batch_size: int = 32) -> list[dict]:
-        """One typed answer per question, in order. See answers() for the fields."""
-        probs = self.probs(state, questions, max_state_tokens, max_question_tokens, batch_size)
+            max_question_tokens: int = 448, batch_size: int = 32, fast: bool | None = None) -> list[dict]:
+        """One typed answer per question, in order. See answers() for the fields. fast=True
+        runs the body under bf16 autocast (see __init__); the default is the decider's."""
+        probs = self.probs(state, questions, max_state_tokens, max_question_tokens, batch_size, fast)
         return answers(questions, probs)
 
     # ----- the single-pass path -----
 
     def logits_sequential(self, state: str, questions: list[Primitive], max_state_tokens: int = 1536,
-                          max_question_tokens: int = 448, batch_size: int = 32) -> torch.Tensor:
+                          max_question_tokens: int = 448, batch_size: int = 32,
+                          fast: bool | None = None) -> torch.Tensor:
         """The training-time path: every full prompt rendered and run through
         Policy.decision_logits, in right-padded batches. For the equivalence proof and the
         latency comparison; it computes the prefix once per question."""
@@ -299,7 +322,7 @@ class Decider:
         prefix_len = len(self._encode(render_prefix(qs[0].context)))
         max_len = prefix_len + max_question_tokens + int(self.policy.prepend_bos)
         chunks = []
-        with torch.no_grad(), self._autocast():
+        with torch.no_grad(), self._autocast(self._fast(fast)):
             for start in range(0, len(qs), batch_size):
                 chunk = qs[start:start + batch_size]
                 logits, _ = self.policy.decision_logits(chunk, max_len, self.device)
@@ -307,8 +330,8 @@ class Decider:
         return torch.cat(chunks)
 
     def ask_sequential(self, state, questions, max_state_tokens: int = 1536, max_question_tokens: int = 448,
-                       batch_size: int = 32) -> list[dict]:
-        logits = self.logits_sequential(state, questions, max_state_tokens, max_question_tokens, batch_size)
+                       batch_size: int = 32, fast: bool | None = None) -> list[dict]:
+        logits = self.logits_sequential(state, questions, max_state_tokens, max_question_tokens, batch_size, fast)
         return answers(questions, torch.softmax(logits, -1))
 
 
