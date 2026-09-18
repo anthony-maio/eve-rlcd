@@ -79,8 +79,8 @@ def to_question(state: str, q: Primitive) -> Question:
 # ---------- the tokenization split ----------
 
 _SPLIT_PROBES = ["plain words", "ends with a digit 42", "ends with punctuation.", "ends with a bang!",
-                 "ends with a paren (x)", "ends with a colon:", "trailing newline\n", "café",
-                 "two lines\nsecond line", "中文"]
+                 "ends with a paren (x)", "ends with a colon:", "trailing newline\n", "caf\u00e9",
+                 "two lines\nsecond line", "\u4e2d\u6587"]
 
 
 def check_split(tok) -> None:
@@ -216,11 +216,18 @@ class Decider:
         return torch.autocast(self.device_type, dtype=torch.bfloat16, enabled=self.autocast)
 
     def prefill(self, prefix: str) -> DynamicCache:
-        """The body's key/value cache over the prefix, at batch size 1."""
+        """The body's key/value cache over the prefix, at batch size 1. The causal mask is
+        passed explicitly as a 4D tensor: with no mask at all, the sdpa integration of
+        transformers 4.57 hands grouped-query attention to torch with enable_gqa, which falls
+        back to the unfused math kernel on builds without flash attention (this one); with a
+        mask it repeats the key/value heads and the fused kernel runs, several times faster on
+        a long state. The result is the same either way."""
         ids = ([self.tok.bos_token_id] if self.policy.prepend_bos else []) + self._encode(prefix)
         ids = torch.tensor([ids], dtype=torch.long, device=self.device)
+        n = ids.shape[1]
+        causal = torch.ones((1, 1, n, n), dtype=torch.bool, device=self.device).tril()
         with torch.no_grad(), self._autocast():
-            out = self.policy._body()(input_ids=ids, attention_mask=torch.ones_like(ids), use_cache=True)
+            out = self.policy._body()(input_ids=ids, attention_mask=causal, use_cache=True)
         return out.past_key_values
 
     def _suffix_batch(self, qs: list[Question]):

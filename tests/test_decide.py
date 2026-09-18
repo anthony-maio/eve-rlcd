@@ -81,7 +81,7 @@ def test_split_tokenization_holds_for_the_qwen_tokenizer_and_not_for_gpt2(qwen_t
 def test_split_tokenization_holds_across_random_prompts(qwen_tok):
     import random
     rng = random.Random(1)
-    pieces = ["word", " tail.", "\n", "  ", "42", "!", "café", "(x)", "end:", "中文"]
+    pieces = ["word", " tail.", "\n", "  ", "42", "!", "caf\u00e9", "(x)", "end:", "\u4e2d\u6587"]
     for _ in range(300):
         context = "".join(rng.choice(pieces) for _ in range(rng.randint(1, 10)))
         q = Question("choice", context, "".join(rng.choice(pieces) for _ in range(3)), ["a", "b", "c"])

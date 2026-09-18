@@ -35,7 +35,7 @@ def test_render_prefix_and_suffix_split_render_prompt_exactly():
 
     from rlcd.schema import render_prefix, render_suffix
     rng = random.Random(0)
-    words = ["alpha", "beta", "gamma\n", "  delta", "eps.", "\n\n", "Question:", "Z)", "café"]
+    words = ["alpha", "beta", "gamma\n", "  delta", "eps.", "\n\n", "Question:", "Z)", "caf\u00e9"]
     for i in range(500):
         context = "".join(rng.choice(words) for _ in range(rng.randint(1, 12)))
         question = "".join(rng.choice(words) for _ in range(rng.randint(1, 6)))
