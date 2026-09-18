@@ -425,6 +425,43 @@ def _check_rope(config) -> None:
                            f"rope_parameters.rope_theta {theta}")
 
 
+def _is_tied_lm_head(model, key: str) -> bool:
+    """True for lm_head.weight when it shares storage with the input embedding: a checkpoint of
+    a tied model stores the embedding only, so the head is not missing at all."""
+    if key != "lm_head.weight":
+        return False
+    head, embed = model.get_output_embeddings(), model.get_input_embeddings()
+    return head is not None and embed is not None and head.weight.data_ptr() == embed.weight.data_ptr()
+
+
+def _from_pretrained_strict(auto_cls, weights: str, **kwargs):
+    """from_pretrained that refuses a checkpoint whose tensors do not match the model exactly,
+    where transformers would only warn and leave the gaps randomly initialized."""
+    model, info = auto_cls.from_pretrained(weights, torch_dtype=torch.float32, output_loading_info=True,
+                                           **kwargs)
+    missing = [k for k in info["missing_keys"] if not _is_tied_lm_head(model, k)]
+    mismatched = [k[0] if isinstance(k, (tuple, list)) else k for k in info.get("mismatched_keys", [])]
+    if missing or info["unexpected_keys"] or mismatched:
+        raise RuntimeError(f"{weights} does not match {type(model).__name__}: missing {missing}, "
+                           f"unexpected {info['unexpected_keys']}, mismatched {mismatched}")
+    return model
+
+
+def _load_adapter_strict(model, adapter_dir: str):
+    """PeftModel.from_pretrained, but refusing an adapter file with missing or stray tensors,
+    where peft would only warn."""
+    from peft import MODEL_TYPE_TO_PEFT_MODEL_MAPPING, PeftConfig, PeftModel
+    config = PeftConfig.from_pretrained(adapter_dir)
+    config.inference_mode = False
+    cls = MODEL_TYPE_TO_PEFT_MODEL_MAPPING.get(config.task_type, PeftModel)
+    peft_model = cls(model, config, adapter_name="default")
+    result = peft_model.load_adapter(adapter_dir, "default", is_trainable=True)
+    if result.missing_keys or result.unexpected_keys:
+        raise RuntimeError(f"{adapter_dir} does not match its adapter config: missing "
+                           f"{list(result.missing_keys)}, unexpected {list(result.unexpected_keys)}")
+    return peft_model
+
+
 def _lineage(path_or_id: str, record: dict) -> tuple[str, str | None, str | None]:
     """(weights, origin, revision) for a load. A saved adapter's weights are its recorded base at
     the recorded revision; anything else loads its own weights. The origin is the hub repo the
@@ -451,7 +488,7 @@ def _load_hf(policy_cls, auto_cls, path_or_id: str, device: str, lora: bool, gra
                                f"remote-code revision is {kwargs['revision']}")
         kwargs["revision"] = revision
     tok = _load_tokenizer(path_or_id, **tok_kwargs)
-    model = auto_cls.from_pretrained(weights, torch_dtype=torch.float32, **kwargs)
+    model = _from_pretrained_strict(auto_cls, weights, **kwargs)
     if tok_kwargs.get("trust_remote_code") or kwargs.get("trust_remote_code"):
         _ENCODER_CODE_LOADED = True
     if policy_cls is HFDecoderPolicy and model.config.model_type == "lfm2":
@@ -463,8 +500,7 @@ def _load_hf(policy_cls, auto_cls, path_or_id: str, device: str, lora: bool, gra
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.config.use_cache = False
     if saved_adapter:
-        from peft import PeftModel
-        model = PeftModel.from_pretrained(model, path_or_id, is_trainable=True)
+        model = _load_adapter_strict(model, path_or_id)
     elif lora:
         from peft import LoraConfig, get_peft_model
         model = get_peft_model(model, LoraConfig(**LORA))

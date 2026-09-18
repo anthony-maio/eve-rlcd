@@ -278,6 +278,44 @@ def test_a_hub_base_records_its_commit_hash_and_reloads_at_that_revision(tmp_pat
     assert loaded.revision == sha
 
 
+def _edit_safetensors(path, drop: str | None = None, add: dict | None = None) -> None:
+    from safetensors.torch import load_file, save_file
+    sd = load_file(str(path))
+    if drop is not None:
+        del sd[drop]
+    sd.update(add or {})
+    save_file(sd, str(path), metadata={"format": "pt"})
+
+
+def test_a_checkpoint_with_a_missing_tensor_is_refused(tmp_path, gpt2_tok):
+    out = tmp_path / "ckpt"
+    HFDecoderPolicy(tiny_llama(), gpt2_tok).save(str(out), {})
+    _edit_safetensors(out / "model.safetensors", drop="model.layers.1.mlp.up_proj.weight")
+    with pytest.raises(RuntimeError, match="model.layers.1.mlp.up_proj.weight"):
+        load_policy(str(out), device="cpu")
+
+
+def test_a_checkpoint_with_an_unexpected_tensor_is_refused(tmp_path, gpt2_tok):
+    out = tmp_path / "ckpt"
+    HFDecoderPolicy(tiny_llama(), gpt2_tok).save(str(out), {})
+    _edit_safetensors(out / "model.safetensors", add={"model.layers.7.stray.weight": torch.zeros(2)})
+    with pytest.raises(RuntimeError, match="model.layers.7.stray.weight"):
+        load_policy(str(out), device="cpu")
+
+
+def test_an_adapter_with_a_missing_tensor_is_refused(tmp_path, gpt2_tok):
+    base_dir = tmp_path / "base"
+    HFDecoderPolicy(tiny_llama(), gpt2_tok).save(str(base_dir), {})
+    policy = load_policy(str(base_dir), device="cpu", lora=True)
+    out = tmp_path / "adapter"
+    policy.save(str(out), {})
+    from safetensors.torch import load_file
+    key = next(k for k in load_file(str(out / "adapter_model.safetensors")) if "layers.0" in k and "lora_A" in k)
+    _edit_safetensors(out / "adapter_model.safetensors", drop=key)
+    with pytest.raises(RuntimeError, match="lora_A"):
+        load_policy(str(out), device="cpu")
+
+
 def test_hf_decoder_gradient_checkpointing_gives_the_same_gradients(tmp_path, gpt2_tok):
     base_dir = tmp_path / "base"
     HFDecoderPolicy(tiny_llama(), gpt2_tok).save(str(base_dir), {})
