@@ -517,7 +517,9 @@ def _load_hf(policy_cls, auto_cls, path_or_id: str, device: str, lora: bool, gra
         _check_lfm2_unpatched(path_or_id)
     _check_rope(model.config)
     if not os.path.isdir(weights):
-        revision = getattr(model.config, "_commit_hash", None) or revision
+        # A remote-code model comes back without config._commit_hash; its load was pinned to
+        # kwargs["revision"], which is then the commit that was loaded.
+        revision = getattr(model.config, "_commit_hash", None) or kwargs.get("revision") or revision
     if grad_checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.config.use_cache = False

@@ -820,9 +820,12 @@ def test_loading_the_pinned_encoder_sets_the_process_flag(mask_tok, monkeypatch)
 
     monkeypatch.setattr(AutoModelForMaskedLM, "from_pretrained", fake_from_pretrained)
     monkeypatch.setattr(policies, "_load_tokenizer", lambda *a, **k: mask_tok)
-    load_policy("fake/pinned", device="cpu", backend="hf-mlm")
+    policy = load_policy("fake/pinned", device="cpu", backend="hf-mlm", lora=True)
     assert seen[-1]["trust_remote_code"] is True and seen[-1]["revision"] == "b" * 40
     assert policies._ENCODER_CODE_LOADED is True
+    # The remote-code model comes back without config._commit_hash (the real encoder does), but
+    # the revision it was loaded at is the pinned one, so that is what the record keeps.
+    assert policy.revision == "b" * 40
 
 
 # ---------- repos written by transformers 5 ----------
