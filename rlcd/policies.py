@@ -488,6 +488,10 @@ def _load_hf(policy_cls, auto_cls, path_or_id: str, device: str, lora: bool, gra
                                f"remote-code revision is {kwargs['revision']}")
         kwargs["revision"] = revision
     tok = _load_tokenizer(path_or_id, **tok_kwargs)
+    recorded_bos = record.get("prepend_bos")
+    if recorded_bos is not None and recorded_bos != _adds_bos(tok):
+        raise RuntimeError(f"{path_or_id} was trained with prepend_bos={recorded_bos}, but its tokenizer "
+                           f"now gives {_adds_bos(tok)}; the prompts would not match the training ones")
     model = _from_pretrained_strict(auto_cls, weights, **kwargs)
     if tok_kwargs.get("trust_remote_code") or kwargs.get("trust_remote_code"):
         _ENCODER_CODE_LOADED = True

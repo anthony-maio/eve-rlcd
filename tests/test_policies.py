@@ -316,6 +316,33 @@ def test_an_adapter_with_a_missing_tensor_is_refused(tmp_path, gpt2_tok):
         load_policy(str(out), device="cpu")
 
 
+def test_a_recorded_prepend_bos_that_disagrees_with_the_tokenizer_is_refused(tmp_path, gpt2_tok):
+    out = tmp_path / "ckpt"
+    HFDecoderPolicy(tiny_llama(), gpt2_tok).save(str(out), {})
+    path = out / "policy.json"
+    record = json.loads(path.read_text())
+    assert record["prepend_bos"] is False
+    path.write_text(json.dumps(record | {"prepend_bos": True}))
+    with pytest.raises(RuntimeError, match="prepend_bos"):
+        load_policy(str(out), device="cpu")
+    del record["prepend_bos"]  # a record written before the field existed is taken as is
+    path.write_text(json.dumps(record))
+    assert load_policy(str(out), device="cpu").prepend_bos is False
+
+
+def test_grad_checkpointing_is_recorded_for_information(tmp_path, gpt2_tok):
+    base_dir = tmp_path / "base"
+    HFDecoderPolicy(tiny_llama(), gpt2_tok).save(str(base_dir), {})
+    policy = load_policy(str(base_dir), device="cpu", grad_checkpointing=True)
+    assert policy.grad_checkpointing is True
+    out = tmp_path / "ckpt"
+    policy.save(str(out), {})
+    assert json.loads((out / "policy.json").read_text())["grad_checkpointing"] is True
+    # The record is informational: a plain reload does not turn checkpointing back on.
+    reloaded = load_policy(str(out), device="cpu")
+    assert reloaded.grad_checkpointing is False and not reloaded.model.is_gradient_checkpointing
+
+
 def test_hf_decoder_gradient_checkpointing_gives_the_same_gradients(tmp_path, gpt2_tok):
     base_dir = tmp_path / "base"
     HFDecoderPolicy(tiny_llama(), gpt2_tok).save(str(base_dir), {})
