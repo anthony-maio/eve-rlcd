@@ -141,6 +141,40 @@ def test_rl_step_runs_on_the_hf_decoder_backend_with_zero_aux():
         assert any(p.grad is not None for p in policy.trainable_parameters())
 
 
+def test_rlvr_and_rlcd_sample_the_same_actions_under_one_seed_on_the_hf_backend(monkeypatch):
+    """The two bandit arms differ only in the reward they assign to what they sampled, so the
+    same policy state and the same seed must give them the same actions and outcomes."""
+    from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
+
+    from rlcd.policies import HFDecoderPolicy
+    torch.manual_seed(0)
+    cfg = LlamaConfig(vocab_size=50257, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+                      num_attention_heads=2, num_key_value_heads=2, max_position_embeddings=256)
+    policy = HFDecoderPolicy(LlamaForCausalLM(cfg), AutoTokenizer.from_pretrained("gpt2")).train()
+    env = BanditEnv(torch.tensor([1, 0]))
+    seen: dict[str, torch.Tensor] = {}
+    real_step = env.step
+
+    def record(arm):
+        def step(idx, actions):
+            seen[arm] = actions.clone()
+            return real_step(idx, actions)
+        return step
+
+    stats = {}
+    for arm in ("rlvr", "rlcd"):
+        monkeypatch.setattr(env, "step", record(arm))
+        torch.manual_seed(123)
+        _, stats[arm] = rl_step(policy, None, _batch(), torch.tensor([0, 1]), env, arm=arm, group=4,
+                                kl_coef=0.0, aux_coef=0.0, max_len=64, device="cpu")
+    assert seen["rlvr"].shape == (2, 4)
+    assert torch.equal(seen["rlvr"], seen["rlcd"])
+    assert stats["rlvr"]["sampled_acc"] == stats["rlcd"]["sampled_acc"]
+    assert stats["rlvr"]["p_taken"] == stats["rlcd"]["p_taken"]
+    # rlcd subtracts p_a from the outcome, so its mean reward sits exactly p_taken below rlvr's.
+    assert abs((stats["rlvr"]["reward"] - stats["rlcd"]["reward"]) - stats["rlvr"]["p_taken"]) < 1e-6
+
+
 def test_training_clis_take_a_backend_lora_and_grad_checkpointing():
     for parser, extra in ((train_sft.build_parser(), []),
                           (train_rl.build_parser(), ["--arm", "rlcd", "--out", "unused"])):

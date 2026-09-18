@@ -17,11 +17,12 @@ def gpt2_tok():
     return AutoTokenizer.from_pretrained("gpt2")
 
 
-def tiny_llama():
+def tiny_llama(tie: bool = False):
     from transformers import LlamaConfig, LlamaForCausalLM
     torch.manual_seed(0)
     cfg = LlamaConfig(vocab_size=50257, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
-                      num_attention_heads=2, num_key_value_heads=2, max_position_embeddings=256)
+                      num_attention_heads=2, num_key_value_heads=2, max_position_embeddings=256,
+                      tie_word_embeddings=tie)
     return LlamaForCausalLM(cfg).eval()
 
 
@@ -150,6 +151,51 @@ def test_hf_decoder_train_eval_and_parameters(gpt2_tok):
     assert list(policy.trainable_parameters()) == params  # a fresh iterable on every call
 
 
+def test_hf_decoder_readout_does_not_depend_on_the_pad_token(gpt2_tok):
+    policy = HFDecoderPolicy(tiny_llama(), gpt2_tok)
+    qs = _questions()  # mixed lengths, so the short rows are padded
+    outs = []
+    for pad in (gpt2_tok.eos_token_id, 0, 1234):
+        policy.pad_id = pad
+        ids, mask, last = policy.encode(qs, 512, "cpu")
+        assert torch.all(ids[mask == 0] == pad)
+        with torch.no_grad():
+            outs.append(policy.decision_logits(qs, 512, "cpu")[0])
+    assert torch.allclose(outs[0], outs[1], atol=1e-6) and torch.allclose(outs[0], outs[2], atol=1e-6)
+
+
+def test_hf_policy_needs_a_pad_or_an_eos_token():
+    class NoPadTok(BosTok):
+        pad_token_id = None
+        eos_token_id = None
+
+    with pytest.raises(ValueError, match="neither a pad token nor an eos token"):
+        HFDecoderPolicy(tiny_llama(), NoPadTok(), letters=list(range(100, 126)))
+    # eos alone is enough to pad with.
+    class EosOnlyTok(BosTok):
+        pad_token_id = None
+
+    assert HFDecoderPolicy(tiny_llama(), EosOnlyTok(), letters=list(range(100, 126))).pad_id == 1
+
+
+def test_predict_logits_restores_train_and_eval_modes_on_the_hf_backend(gpt2_tok):
+    from rlcd.quick_eval import predict_logits
+    policy = HFDecoderPolicy(tiny_llama(), gpt2_tok)
+    qs = _questions()
+    policy.train()
+    rows = predict_logits(policy, qs, max_len=512, batch_size=2, device="cpu")
+    assert policy.training and policy.model.training
+    assert [len(r) for r in rows] == [q.k for q in qs]
+    policy.eval()
+    predict_logits(policy, qs, max_len=512, batch_size=2, device="cpu")
+    assert not policy.training and not policy.model.training
+    # The mode comes back even when the forward raises.
+    policy.train()
+    with pytest.raises(ValueError, match="no room"):
+        predict_logits(policy, qs, max_len=0, batch_size=2, device="cpu")
+    assert policy.training
+
+
 def test_hf_decoder_gradients_reach_the_body_and_the_letter_rows(gpt2_tok):
     policy = HFDecoderPolicy(tiny_llama(), gpt2_tok)
     policy.train()
@@ -180,6 +226,39 @@ def test_hf_decoder_save_and_load_round_trip_through_policy_json(tmp_path, gpt2_
     with torch.no_grad():
         a, _ = policy.decision_logits(qs, 512, "cpu")
         b, _ = loaded.decision_logits(qs, 512, "cpu")
+    assert torch.allclose(a, b, atol=1e-6)
+
+
+def test_tied_embeddings_survive_an_optimizer_step_and_a_save_reload(tmp_path, gpt2_tok):
+    """With tied embeddings the letter rows of the output head are the letter rows of the input
+    embedding: a step must move them there too, keep the tie, and the tie must come back."""
+    policy = HFDecoderPolicy(tiny_llama(tie=True), gpt2_tok)
+    model = policy.model
+    embed, head = model.get_input_embeddings(), model.get_output_embeddings()
+    assert head.weight.data_ptr() == embed.weight.data_ptr()
+    letters = torch.tensor(policy.letters)
+    before = embed.weight[letters].detach().clone()
+    policy.train()
+    opt = torch.optim.AdamW(policy.trainable_parameters(), lr=1e-2, weight_decay=0.0)
+    logits, _ = policy.decision_logits(_questions(), 512, "cpu")
+    torch.log_softmax(logits, -1)[:, 0].sum().neg().backward()
+    opt.step()
+    assert head.weight.data_ptr() == embed.weight.data_ptr()
+    assert not torch.allclose(embed.weight[letters], before)
+    assert torch.equal(head.weight[letters], embed.weight[letters])
+    assert sum(1 for p in policy.trainable_parameters() if p.data_ptr() == embed.weight.data_ptr()) == 1
+
+    out = tmp_path / "tied"
+    policy.save(str(out), {})
+    loaded = load_policy(str(out), device="cpu")
+    l_embed, l_head = loaded.model.get_input_embeddings(), loaded.model.get_output_embeddings()
+    assert l_head.weight.data_ptr() == l_embed.weight.data_ptr()
+    assert torch.equal(l_embed.weight, embed.weight.detach())
+    policy.eval()
+    loaded.eval()
+    with torch.no_grad():
+        a, _ = policy.decision_logits(_questions(), 512, "cpu")
+        b, _ = loaded.decision_logits(_questions(), 512, "cpu")
     assert torch.allclose(a, b, atol=1e-6)
 
 
