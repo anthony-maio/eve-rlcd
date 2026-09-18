@@ -62,6 +62,28 @@ def test_hf_decoder_logits_equal_the_models_own_full_logit_slice(build, gpt2_tok
     assert aux.ndim == 0 and aux.item() == 0.0
 
 
+def test_hf_decoder_logits_from_hidden_is_the_readout_of_decision_logits(gpt2_tok):
+    """decision_logits is the body's readout rows through logits_from_hidden, and the head is
+    the 26 letter rows of the output embedding, so callers with their own hidden states (a
+    cached-prefix path) get the same fp32 masked logits."""
+    policy = HFDecoderPolicy(tiny_llama(), gpt2_tok)
+    qs = _questions()
+    with torch.no_grad():
+        want, _ = policy.decision_logits(qs, max_len=512, device="cpu")
+        ids, mask, last = policy.encode(qs, 512, "cpu")
+        hidden = policy.model.model(input_ids=ids, attention_mask=mask).last_hidden_state
+        rows = hidden[torch.arange(len(qs)), last]
+        got = policy.logits_from_hidden(rows, [q.k for q in qs])
+        got_tensor_k = policy.logits_from_hidden(rows.to(torch.bfloat16), torch.tensor([q.k for q in qs]))
+    assert got.dtype == torch.float32 and got.shape == (3, 26)
+    assert torch.allclose(got, want, atol=1e-6)
+    assert torch.all(got[0, 3:] == NEG) and torch.all(got[1, 2:] == NEG)
+    assert got_tensor_k.dtype == torch.float32  # a bf16 row is promoted, never the head demoted
+    weight, bias = policy.letter_head()
+    assert weight.shape == (26, 32) and bias is None
+    assert torch.equal(weight, policy.model.lm_head.weight[torch.tensor(policy.letters)])
+
+
 def test_hf_decoder_padded_batch_matches_single_rows(gpt2_tok):
     policy = HFDecoderPolicy(tiny_llama(), gpt2_tok)
     qs = _questions()

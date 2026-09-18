@@ -156,7 +156,12 @@ def remote_code_kwargs(path_or_id: str, origin: str | None = None) -> dict:
 
 
 def _mask_beyond_k(logits: torch.Tensor, questions: list[Question]) -> torch.Tensor:
-    k = torch.tensor([q.k for q in questions], dtype=torch.long, device=logits.device)
+    return mask_beyond_k(logits, [q.k for q in questions])
+
+
+def mask_beyond_k(logits: torch.Tensor, ks) -> torch.Tensor:
+    """NEG at every letter position at or beyond each row's option count."""
+    k = torch.as_tensor(ks, dtype=torch.long, device=logits.device)
     positions = torch.arange(MAX_CHOICES, device=logits.device)[None, :]
     return logits.masked_fill(positions >= k[:, None], NEG)
 
@@ -305,19 +310,31 @@ class HFDecoderPolicy(_HFPolicy):
             raise ValueError(f"cannot find the decoder body of {type(model).__name__}")
         return body
 
+    def letter_head(self) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The 26 letter rows of the output embedding, (26, d), and their bias if the head has
+        one. Everything the decision needs from the vocabulary projection."""
+        head = self._hf_model().get_output_embeddings()
+        index = torch.as_tensor(self.letters, device=head.weight.device)
+        bias = getattr(head, "bias", None)
+        return head.weight[index], None if bias is None else bias[index]
+
+    def logits_from_hidden(self, rows: torch.Tensor, ks) -> torch.Tensor:
+        """fp32 decision logits (B, 26) from the body's final hidden state at each row's readout
+        position, masked at and beyond each row's option count. The matmul runs in fp32 with
+        autocast off: autocast would downcast it and quantize the decision logits."""
+        with torch.autocast(device_type=rows.device.type, enabled=False):
+            weight, bias = self.letter_head()
+            logits = rows.float() @ weight.float().t()
+            if bias is not None:
+                logits = logits + bias.float()
+            return mask_beyond_k(logits, ks)
+
     def decision_logits(self, questions, max_len, device):
         """Runs the body only and multiplies the decision rows by the 26 letter rows of the
         output embedding, so full-vocabulary logits are never materialized."""
         rows = self._readout_rows(questions, max_len, device)
-        head = self._hf_model().get_output_embeddings()
-        # Autocast off: it would downcast the matmul and quantize the decision logits.
-        with torch.autocast(device_type=rows.device.type, enabled=False):
-            index = torch.as_tensor(self.letters, device=rows.device)
-            logits = rows.float() @ head.weight[index].float().t()
-            if getattr(head, "bias", None) is not None:
-                logits = logits + head.bias[index].float()
-            aux = torch.zeros((), device=rows.device, dtype=torch.float32)
-            return _mask_beyond_k(logits, questions), aux
+        aux = torch.zeros((), device=rows.device, dtype=torch.float32)
+        return self.logits_from_hidden(rows, [q.k for q in questions]), aux
 
 
 def _mlm_head(model):

@@ -74,6 +74,24 @@ def render_prompt(q: Question) -> str:
     return "\n".join(lines)
 
 
+def render_prefix(context: str) -> str:
+    """The part of the prompt that depends on the context only: the header, the stripped
+    context, and the blank line before Question. render_prefix(q.context) + render_suffix(q)
+    is exactly render_prompt(q)."""
+    return f"User: Context:\n{context.strip()}\n\n"
+
+
+def render_suffix(q: Question) -> str:
+    """Everything from Question: onward, so that one context prefix can be shared by many
+    questions. See render_prefix."""
+    lines = [f"Question: {q.question.strip()}", "Options:"]
+    for letter, choice in zip(LETTERS, q.choices):
+        lines.append(f"{letter}) {choice}")
+    lines.append("Answer with the letter only.")
+    lines.append("Assistant: The answer is")
+    return "\n".join(lines)
+
+
 def letter_token_ids(tokenizer) -> list[int]:
     ids: list[int] = []
     for letter in LETTERS:

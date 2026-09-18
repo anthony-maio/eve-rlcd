@@ -30,6 +30,24 @@ def test_render_prompt_exact():
     )
 
 
+def test_render_prefix_and_suffix_split_render_prompt_exactly():
+    import random
+
+    from rlcd.schema import render_prefix, render_suffix
+    rng = random.Random(0)
+    words = ["alpha", "beta", "gamma\n", "  delta", "eps.", "\n\n", "Question:", "Z)", "café"]
+    for i in range(500):
+        context = "".join(rng.choice(words) for _ in range(rng.randint(1, 12)))
+        question = "".join(rng.choice(words) for _ in range(rng.randint(1, 6)))
+        k = rng.randint(2, 26)
+        choices = [f"opt {j} {rng.choice(words[:5]).strip()}" for j in range(k)]
+        item = q(context=context, question=question, choices=choices, answer=0)
+        assert render_prefix(item.context) + render_suffix(item) == render_prompt(item), i
+    assert render_prefix("  s  ") == "User: Context:\ns\n\n"
+    assert render_suffix(q(question=" Which? ")).startswith("Question: Which?\nOptions:\nA) a\n")
+    assert render_suffix(q()).endswith("\nAnswer with the letter only.\nAssistant: The answer is")
+
+
 def test_render_prompt_26_choices_ends_with_z():
     text = render_prompt(q(choices=[f"opt{i}" for i in range(26)], answer=0).validate())
     lines = text.split("\n")
