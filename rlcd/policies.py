@@ -230,7 +230,8 @@ class _HFPolicy(_PolicyBase):
                  grad_checkpointing: bool = False):
         """base: for a LoRA policy, the path or hub id of the weights the adapter sits on, and
         None for a full fine-tune. origin: the hub repo the lineage started from, used only to
-        decide about remote code. revision: the hub commit of base when base is a hub id."""
+        decide about remote code. revision: the hub commit the lineage started from (of base
+        for a LoRA policy, of the weights first loaded for a full fine-tune), or None."""
         self.model = model
         self.tok = tok
         self.letters = letter_token_ids(tok) if letters is None else list(letters)
@@ -537,6 +538,10 @@ def _load_hf(policy_cls, auto_cls, path_or_id: str, device: str, lora: bool, gra
         # A remote-code model comes back without config._commit_hash; its load was pinned to
         # kwargs["revision"], which is then the commit that was loaded.
         revision = getattr(model.config, "_commit_hash", None) or kwargs.get("revision") or revision
+    elif not saved_adapter:
+        # A full fine-tune directory keeps the hub commit its lineage started from, as
+        # information only: its weights are its own and were loaded from the directory.
+        revision = record.get("revision")
     if grad_checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.config.use_cache = False
@@ -550,7 +555,7 @@ def _load_hf(policy_cls, auto_cls, path_or_id: str, device: str, lora: bool, gra
     model.to(device)
     lora = saved_adapter or lora
     return policy_cls(model, tok, base=weights if lora else None, lora=lora, origin=origin,
-                      revision=revision if lora else None, grad_checkpointing=grad_checkpointing)
+                      revision=revision, grad_checkpointing=grad_checkpointing)
 
 
 def load_policy(path_or_id: str, device: str = "cuda", backend: str = "auto", lora: bool = False,

@@ -379,6 +379,51 @@ def test_a_hub_base_records_its_commit_hash_and_reloads_at_that_revision(tmp_pat
     assert loaded.revision == sha
 
 
+def test_a_full_fine_tune_of_a_hub_base_records_its_commit_hash_too(tmp_path, gpt2_tok, monkeypatch):
+    """The revision is lineage information for a full fine-tune as well: it says which hub
+    commit the weights started from, and it survives a save and reload of the directory
+    (whose weights are local, so the reload never passes it to from_pretrained)."""
+    import rlcd.policies as policies
+    from transformers import AutoModelForCausalLM
+    sha = "fedcba9876543210fedcba9876543210fedcba98"
+    calls = []
+
+    def fake_from_pretrained(name, **kwargs):
+        calls.append((name, kwargs))
+        model = tiny_llama()
+        model.config._commit_hash = sha if not os.path.isdir(name) else None
+        info = {"missing_keys": [], "unexpected_keys": [], "mismatched_keys": [], "error_msgs": []}
+        return (model, info) if kwargs.get("output_loading_info") else model
+
+    monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", fake_from_pretrained)
+    monkeypatch.setattr(policies, "_load_tokenizer", lambda *a, **k: gpt2_tok)
+    policy = load_policy("fake/hub-model", device="cpu")
+    assert (policy.lora, policy.base, policy.origin, policy.revision) == (False, None, "fake/hub-model", sha)
+    out = tmp_path / "sft"
+    policy.save(str(out), {})
+    record = json.loads((out / "policy.json").read_text())
+    assert (record["lora"], record["base"], record["origin"], record["revision"]) == (False, None, "fake/hub-model", sha)
+    monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", fake_from_pretrained)
+    reloaded = load_policy(str(out), device="cpu")
+    assert calls[-1][0] == str(out) and "revision" not in calls[-1][1]
+    assert reloaded.revision == sha
+    again = tmp_path / "again"
+    reloaded.save(str(again), {})
+    assert json.loads((again / "policy.json").read_text())["revision"] == sha
+
+
+def test_an_adapter_revision_that_disagrees_with_the_pinned_code_revision_is_refused(tmp_path, monkeypatch):
+    import rlcd.policies as policies
+    from rlcd.policies import PinnedCode
+    monkeypatch.setattr(policies, "PINNED_REMOTE_CODE", {"fake/pinned": PinnedCode("b" * 40, {})})
+    out = tmp_path / "adapter"
+    out.mkdir()
+    (out / "policy.json").write_text(json.dumps({"backend": "hf-mlm", "lora": True, "base": "fake/pinned",
+                                                 "origin": "fake/pinned", "revision": "a" * 40}))
+    with pytest.raises(RuntimeError, match="pinned remote-code revision"):
+        load_policy(str(out), device="cpu")
+
+
 def _edit_safetensors(path, drop: str | None = None, add: dict | None = None) -> None:
     from safetensors.torch import load_file, save_file
     sd = load_file(str(path))

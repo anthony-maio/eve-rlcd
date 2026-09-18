@@ -13,7 +13,7 @@ QWEN = "Qwen/Qwen3-0.6B-Base"
 STATE = "Ticket #77 from an enterprise, tier 1 customer. Report: pods crash looping in prod. Note: production is down."
 QUESTIONS = [ChoiceQ("Which department should handle this ticket?", ["BILLING", "INFRASTRUCTURE", "SECURITY"]),
              ScoreQ("What is the priority of this ticket?", ["P3_LOW", "P2_NORMAL", "P1_HIGH", "P0_CRITICAL"]),
-             NoulQ("an on-call engineer should be paged immediately")]
+             NoulQ("Should an on-call engineer be paged immediately?")]
 
 
 @pytest.fixture(scope="module")
@@ -108,6 +108,29 @@ def test_a_tied_model_says_so_in_the_note(tmp_path, qwen_tok):
                               "API, it does not make generation physically impossible.")
     exported = Decider.load(str(tmp_path / "decision"), device="cpu")
     _same(exported.ask(STATE, QUESTIONS), Decider(policy, device="cpu").ask(STATE, QUESTIONS))
+
+
+def test_export_records_hashes_and_refuses_tampered_weights(checkpoint, tmp_path):
+    import hashlib
+    out = tmp_path / "decision"
+    record = export(checkpoint, str(out))
+    for name in ("model.safetensors", HEAD_FILE):
+        assert record["sha256"][name] == hashlib.sha256((out / name).read_bytes()).hexdigest()
+    load_decision_only(str(out), "cpu")
+    readme = (out / "README.md").read_text()
+    assert "fix_mistral_regex" in readme and "unaffected" in readme
+    # A flipped byte in the head is caught before anything runs.
+    head = bytearray((out / HEAD_FILE).read_bytes())
+    head[-1] ^= 1
+    (out / HEAD_FILE).write_bytes(head)
+    with pytest.raises(RuntimeError, match=HEAD_FILE):
+        load_decision_only(str(out), "cpu")
+    export(checkpoint, str(out))
+    body = bytearray((out / "model.safetensors").read_bytes())
+    body[-1] ^= 1
+    (out / "model.safetensors").write_bytes(body)
+    with pytest.raises(RuntimeError, match="model.safetensors"):
+        load_decision_only(str(out), "cpu")
 
 
 def test_export_refuses_an_adapter_and_a_tampered_record(checkpoint, tmp_path):

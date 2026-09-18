@@ -7,6 +7,7 @@ directory is a decision model, not a text generator, as far as this code base is
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,7 +15,7 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file, save_file
 
-from rlcd.decide import CONFIDENCE_DEFINITIONS, NOUL_TEMPLATE
+from rlcd.decide import CONFIDENCE_DEFINITIONS, NOUL_OPTIONS
 from rlcd.policies import (HFDecoderPolicy, _adds_bos, _check_rope, _from_pretrained_strict, _load_tokenizer,
                            load_policy)
 from rlcd.schema import LETTERS, MAX_CHOICES, letter_token_ids
@@ -41,8 +42,9 @@ PRIMITIVES = {
                "answer": ["kind", "value", "probs", "confidence", "entropy_confidence"]},
     "score": {"fields": ["question", "levels"], "options": "2..26 ordered levels, low to high, one letter each",
               "answer": ["kind", "value", "probs", "confidence", "entropy_confidence", "score"]},
-    "noul": {"fields": ["proposition"], "options": "the question " + repr(NOUL_TEMPLATE) + " with options "
-             "[true, false]", "answer": ["kind", "p_true", "confidence"]},
+    "noul": {"fields": ["question"], "options": "a yes/no question rendered verbatim with the options "
+             + repr(list(NOUL_OPTIONS)) + ", as the noul rows of the training data are",
+             "answer": ["kind", "p_true", "confidence"]},
 }
 
 NOTE_TIED = ("{model} ties its output head to the input embedding, so the vocabulary projection is recoverable "
@@ -60,9 +62,14 @@ confidence definitions and the training summary. There is no language-model head
 no text is generated: the model reads a state and typed questions and returns probabilities over the
 declared options.
 
-Load it with `rlcd.decide.Decider.load("{out}")` and call `ask(state, questions)`.
+Load it with `rlcd.decide.Decider.load("{out}")` and call `ask(state, questions)`. `decision.json`
+records the sha256 of `model.safetensors` and `{head_file}`, and the loader verifies both.
 
 Note: {note}
+
+Tokenizer warning: transformers 4.57 prints "The tokenizer you are loading ... with an incorrect regex
+pattern ... fix_mistral_regex" when this tokenizer loads. The warning is spurious for this tokenizer (it
+is not a Mistral tokenizer); the encodings are unaffected and are the ones the model was trained on.
 """
 
 
@@ -77,7 +84,16 @@ def _read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
 
 
-def _write_export(out: Path, body, tok, weight: torch.Tensor, bias: torch.Tensor | None, record: dict) -> None:
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 24), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _write_export(out: Path, body, tok, weight: torch.Tensor, bias: torch.Tensor | None, record: dict) -> dict:
+    """Write everything and return the record with the hashes of the weight files filled in."""
     out.mkdir(parents=True, exist_ok=True)
     body.save_pretrained(out, safe_serialization=True)
     tok.save_pretrained(out)
@@ -85,10 +101,12 @@ def _write_export(out: Path, body, tok, weight: torch.Tensor, bias: torch.Tensor
     if bias is not None:
         tensors["bias"] = bias.detach().to("cpu", torch.float32).contiguous()
     save_file(tensors, str(out / HEAD_FILE), metadata={"format": "pt"})
+    record = dict(record, sha256={name: _sha256(out / name) for name in ("model.safetensors", HEAD_FILE)})
     (out / DECISION_FILE).write_text(json.dumps(record, indent=2), encoding="utf-8")
     (out / "README.md").write_text(README.format(source=record["source"], head_file=HEAD_FILE,
                                                  decision_file=DECISION_FILE, out=out.as_posix(),
                                                  note=record["note"]), encoding="utf-8")
+    return record
 
 
 def export(src: str, out: str) -> dict:
@@ -127,8 +145,7 @@ def export(src: str, out: str) -> dict:
         "policy": record_in,
         "note": (NOTE_TIED if tied else NOTE_UNTIED).format(model=name),
     }
-    _write_export(out_path, policy._body(), policy.tok, weight, bias, record)
-    return record
+    return _write_export(out_path, policy._body(), policy.tok, weight, bias, record)
 
 
 class DecisionOnlyPolicy(HFDecoderPolicy):
@@ -161,6 +178,10 @@ def load_decision_only(path: str, device: str = "cuda") -> DecisionOnlyPolicy:
     record = json.loads(Path(path, DECISION_FILE).read_text(encoding="utf-8"))
     if record.get("format") != FORMAT:
         raise RuntimeError(f"{path} has export format {record.get('format')!r}, expected {FORMAT!r}")
+    for name, digest in record["sha256"].items():
+        actual = _sha256(Path(path, name))
+        if actual != digest:
+            raise RuntimeError(f"{path}/{name} has sha256 {actual}, but {DECISION_FILE} records {digest}")
     tok = _load_tokenizer(path)
     if letter_token_ids(tok) != list(record["letter_ids"]):
         raise RuntimeError(f"{path}: the tokenizer no longer gives the recorded letter ids")
