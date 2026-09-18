@@ -56,11 +56,17 @@ def _pid_alive(pid: str) -> bool:
 
 
 def remote_done(api, repo: str, name: str) -> bool:
+    """True only if the remote status says the job and its evaluations all exited 0."""
     try:
         files = api.list_repo_files(repo, repo_type="dataset")
+        if f"runs/{name}/status.json" not in files:
+            return False
+        path = api.hf_hub_download(repo, f"runs/{name}/status.json", repo_type="dataset")
+        status = json.loads(Path(path).read_text(encoding="utf-8"))
     except Exception:
         return False
-    return f"runs/{name}/status.json" in files
+    codes = [status.get("exit_code")] + [v for k, v in status.items() if k.startswith("eval_") and k.endswith("_exit")]
+    return all(c == 0 for c in codes)
 
 
 def upload_run(api, repo: str, name: str, upload_weights: bool) -> None:
@@ -108,7 +114,11 @@ def main(argv=None) -> int:
         t0 = time.time()
         print(f"[start] {name}", flush=True)
         log_path = Path("runs") / name / "console.log"
-        code = run_cmd(job["cmd"], log_path)
+        cmd = job["cmd"]
+        if (Path("runs") / name / "train_log.jsonl").exists() and "--overwrite" not in cmd:
+            print(f"[note] {name}: a partial local log exists from an earlier attempt; rerunning with --overwrite", flush=True)
+            cmd += " --overwrite"
+        code = run_cmd(cmd, log_path)
         status = {"name": name, "cmd": job["cmd"], "exit_code": code, "seconds": round(time.time() - t0, 1)}
         if code == 0 and job.get("eval"):
             for sub in ("run", "probe"):
