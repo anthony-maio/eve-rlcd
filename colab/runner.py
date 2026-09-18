@@ -47,6 +47,14 @@ def run_cmd(cmd: str, log_path: Path) -> int:
         return proc.wait()
 
 
+def _pid_alive(pid: str) -> bool:
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (ValueError, ProcessLookupError, PermissionError, OSError):
+        return False
+
+
 def remote_done(api, repo: str, name: str) -> bool:
     try:
         files = api.list_repo_files(repo, repo_type="dataset")
@@ -78,6 +86,16 @@ def main(argv=None) -> int:
             print(j["name"], "::", j["cmd"])
         return 0
 
+    lock = Path("runs") / "runner.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    if lock.exists():
+        old_pid = lock.read_text().strip()
+        if _pid_alive(old_pid):
+            print(f"[abort] another runner (pid {old_pid}) is still running; not starting a second one", flush=True)
+            return 2
+        print(f"[note] stale lock from pid {old_pid}; taking over", flush=True)
+    lock.write_text(str(os.getpid()))
+
     from huggingface_hub import HfApi  # imported late so --dry-run needs no token
     api = HfApi()
     api.create_repo(args.hf_repo, repo_type="dataset", private=True, exist_ok=True)
@@ -99,12 +117,19 @@ def main(argv=None) -> int:
                     extra += " --split data/test.jsonl"
                 status[f"eval_{sub}_exit"] = run_cmd(extra, log_path)
         (Path("runs") / name).mkdir(parents=True, exist_ok=True)
+        if code != 0:
+            tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-15:] if log_path.exists() else []
+            status["error_tail"] = tail
+            print(f"[fail] {name} exit={code}; last log lines:", flush=True)
+            for line in tail:
+                print("    " + line, flush=True)
+            print(f"[stop] {name} failed; later jobs may depend on it. Fix and rerun.", flush=True)
+            lock.unlink(missing_ok=True)
+            return code
         (Path("runs") / name / "status.json").write_text(json.dumps(status, indent=2))
         upload_run(api, args.hf_repo, name, args.upload_weights)
         print(f"[done] {name} exit={code} in {status['seconds']}s", flush=True)
-        if code != 0:
-            print(f"[stop] {name} failed; later jobs may depend on it. Fix and rerun.", flush=True)
-            return code
+    lock.unlink(missing_ok=True)
     return 0
 
 
