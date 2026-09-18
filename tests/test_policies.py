@@ -554,6 +554,78 @@ def test_loading_a_tampered_local_checkpoint_of_a_pinned_base_is_refused(tmp_pat
         load_policy(ckpt, device="cpu")
 
 
+# ---------- the LFM2 decoder must never share a process with the patched encoder ----------
+
+def tiny_lfm2():
+    from transformers import Lfm2Config, Lfm2ForCausalLM
+    torch.manual_seed(0)
+    cfg = Lfm2Config(vocab_size=50257, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+                     num_attention_heads=2, num_key_value_heads=2, layer_types=["conv", "full_attention"],
+                     max_position_embeddings=256)
+    return Lfm2ForCausalLM(cfg).eval()
+
+
+@pytest.fixture()
+def lfm2_dir(tmp_path, gpt2_tok):
+    out = tmp_path / "lfm2"
+    HFDecoderPolicy(tiny_lfm2(), gpt2_tok).save(str(out), {})
+    return str(out)
+
+
+def test_an_untouched_lfm2_decoder_loads_and_matches_its_own_logits(lfm2_dir):
+    policy = load_policy(lfm2_dir, device="cpu").eval()
+    q = _questions()[0]
+    with torch.no_grad():
+        got, _ = policy.decision_logits([q], 512, "cpu")
+        want = _full_logit_slice(policy, q)
+    assert torch.allclose(got[0, : q.k], want[: q.k], atol=1e-4)
+
+
+def test_an_lfm2_decoder_is_refused_once_the_pinned_encoder_code_has_loaded(lfm2_dir, monkeypatch):
+    import rlcd.policies as policies
+    monkeypatch.setattr(policies, "_ENCODER_CODE_LOADED", True)
+    with pytest.raises(RuntimeError, match="LFM2.5-Encoder"):
+        load_policy(lfm2_dir, device="cpu")
+
+
+def test_an_lfm2_decoder_is_refused_when_the_lfm2_module_has_been_patched(lfm2_dir, monkeypatch):
+    import transformers.models.lfm2.modeling_lfm2 as lfm2
+
+    def other_mask(*args, **kwargs):
+        return None
+
+    def other_forward(self, *args, **kwargs):
+        return None
+
+    monkeypatch.setattr(lfm2, "create_causal_mask", other_mask)
+    with pytest.raises(RuntimeError, match="create_causal_mask"):
+        load_policy(lfm2_dir, device="cpu")
+    monkeypatch.undo()
+    monkeypatch.setattr(lfm2.Lfm2ShortConv, "slow_forward", other_forward)
+    with pytest.raises(RuntimeError, match="slow_forward"):
+        load_policy(lfm2_dir, device="cpu")
+
+
+def test_loading_the_pinned_encoder_sets_the_process_flag(mask_tok, monkeypatch):
+    import rlcd.policies as policies
+    from transformers import AutoModelForMaskedLM
+    monkeypatch.setattr(policies, "PINNED_REMOTE_CODE", {"fake/pinned": policies.PinnedCode("b" * 40, {})})
+    monkeypatch.setattr(policies, "_ENCODER_CODE_LOADED", False)
+    seen = []
+
+    def fake_from_pretrained(name, **kwargs):
+        seen.append(kwargs)
+        model = tiny_bert(len(mask_tok))
+        info = {"missing_keys": [], "unexpected_keys": [], "mismatched_keys": [], "error_msgs": []}
+        return (model, info) if kwargs.get("output_loading_info") else model
+
+    monkeypatch.setattr(AutoModelForMaskedLM, "from_pretrained", fake_from_pretrained)
+    monkeypatch.setattr(policies, "_load_tokenizer", lambda *a, **k: mask_tok)
+    load_policy("fake/pinned", device="cpu", backend="hf-mlm")
+    assert seen[-1]["trust_remote_code"] is True and seen[-1]["revision"] == "b" * 40
+    assert policies._ENCODER_CODE_LOADED is True
+
+
 # ---------- repos written by transformers 5 ----------
 
 def test_tokenizer_falls_back_when_the_config_names_a_transformers_5_class(tmp_path, gpt2_tok):

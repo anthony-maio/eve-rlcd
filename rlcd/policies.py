@@ -49,6 +49,28 @@ PINNED_REMOTE_CODE: dict[str, PinnedCode] = {
         {"modeling_lfm2_bidirectional.py": "f171f518be2a07da48b17fdea5655cad0a2452ab548e90e8ae903143686647e2"}),
 }
 
+# Set once any pinned custom code has been imported into this process. The encoder's code patches
+# the lfm2 module, so no causal LFM2 decoder may be loaded afterwards.
+_ENCODER_CODE_LOADED = False
+
+
+def _check_lfm2_unpatched(path_or_id: str) -> None:
+    """Refuse to run a causal LFM2 decoder in a process where the encoder's patches are, or may
+    be, in place: the flag says the pinned code was imported, and the two identity checks catch
+    the patch itself, whoever installed it."""
+    import transformers.masking_utils as masking
+    import transformers.models.lfm2.modeling_lfm2 as lfm2
+    if _ENCODER_CODE_LOADED:
+        raise RuntimeError(f"cannot load the LFM2 decoder {path_or_id}: the LiquidAI/LFM2.5-Encoder "
+                           "custom code has been imported into this process and has patched the "
+                           "transformers lfm2 module to be non-causal; use a fresh process")
+    if lfm2.create_causal_mask is not masking.create_causal_mask:
+        raise RuntimeError(f"cannot load the LFM2 decoder {path_or_id}: "
+                           "transformers.models.lfm2.modeling_lfm2.create_causal_mask has been replaced")
+    if lfm2.Lfm2ShortConv.slow_forward.__module__ != "transformers.models.lfm2.modeling_lfm2":
+        raise RuntimeError(f"cannot load the LFM2 decoder {path_or_id}: Lfm2ShortConv.slow_forward "
+                           f"comes from {lfm2.Lfm2ShortConv.slow_forward.__module__}")
+
 
 class Policy(Protocol):
     name: str
@@ -417,17 +439,23 @@ def _lineage(path_or_id: str, record: dict) -> tuple[str, str | None, str | None
 
 
 def _load_hf(policy_cls, auto_cls, path_or_id: str, device: str, lora: bool, grad_checkpointing: bool):
+    global _ENCODER_CODE_LOADED
     record = _read_record(path_or_id)
     saved_adapter = bool(record.get("lora"))
     weights, origin, revision = _lineage(path_or_id, record)
-    tok = _load_tokenizer(path_or_id, **remote_code_kwargs(path_or_id, origin))
+    tok_kwargs = remote_code_kwargs(path_or_id, origin)
     kwargs = remote_code_kwargs(weights, origin)
     if revision is not None:
         if kwargs.get("revision", revision) != revision:
             raise RuntimeError(f"{path_or_id} was trained on {weights} at {revision}, but the pinned "
                                f"remote-code revision is {kwargs['revision']}")
         kwargs["revision"] = revision
+    tok = _load_tokenizer(path_or_id, **tok_kwargs)
     model = auto_cls.from_pretrained(weights, torch_dtype=torch.float32, **kwargs)
+    if tok_kwargs.get("trust_remote_code") or kwargs.get("trust_remote_code"):
+        _ENCODER_CODE_LOADED = True
+    if policy_cls is HFDecoderPolicy and model.config.model_type == "lfm2":
+        _check_lfm2_unpatched(path_or_id)
     _check_rope(model.config)
     if not os.path.isdir(weights):
         revision = getattr(model.config, "_commit_hash", None) or revision
