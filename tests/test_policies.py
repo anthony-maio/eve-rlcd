@@ -1,4 +1,5 @@
 import json
+import os
 
 import pytest
 import torch
@@ -161,11 +162,12 @@ def test_hf_decoder_gradients_reach_the_body_and_the_letter_rows(gpt2_tok):
 
 
 def test_hf_decoder_save_and_load_round_trip_through_policy_json(tmp_path, gpt2_tok):
-    policy = HFDecoderPolicy(tiny_llama(), gpt2_tok, base_id="some/base")
+    policy = HFDecoderPolicy(tiny_llama(), gpt2_tok, origin="some/base")
     out = tmp_path / "ckpt"
     policy.save(str(out), {"steps": 3})
     record = json.loads((out / "policy.json").read_text())
     assert record["backend"] == "hf-decoder" and record["lora"] is False
+    assert record["base"] is None and record["origin"] == "some/base"  # a full fine-tune sits on nothing
     assert json.loads((out / "meta.json").read_text()) == {"steps": 3}
 
     assert resolve_backend(str(out), "auto") == "hf-decoder"
@@ -190,16 +192,13 @@ def test_hf_decoder_lora_trains_only_adapters_and_round_trips(tmp_path, gpt2_tok
     assert names and all("lora_" in n for n in names)
     trainable = list(policy.trainable_parameters())
     assert len(trainable) == len(names)
-    with torch.no_grad():  # lora_B starts at zero; move it so the adapter changes the output
-        for n, p in policy.model.named_parameters():
-            if "lora_B" in n:
-                p.add_(0.05 * torch.randn_like(p))
+    _perturb_lora_b(policy)
 
     out = tmp_path / "adapter"
     policy.save(str(out), {"steps": 1})
     record = json.loads((out / "policy.json").read_text())
-    assert record == {"backend": "hf-decoder", "lora": True, "base": str(base_dir),
-                      "prepend_bos": False}
+    assert record == {"backend": "hf-decoder", "lora": True, "base": str(base_dir), "origin": None,
+                      "revision": None, "prepend_bos": False, "grad_checkpointing": False}
     assert (out / "adapter_config.json").is_file()
     assert not (out / "model.safetensors").exists()  # the adapter only, never the base weights
 
@@ -213,6 +212,70 @@ def test_hf_decoder_lora_trains_only_adapters_and_round_trips(tmp_path, gpt2_tok
         plain, _ = load_policy(str(base_dir), device="cpu").decision_logits(qs, 512, "cpu")
     assert torch.allclose(a, b, atol=1e-5)
     assert not torch.allclose(a[0, :3], plain[0, :3], atol=1e-5)
+
+
+def _perturb_lora_b(policy) -> None:
+    """lora_B starts at zero; move it so the adapter changes the output."""
+    with torch.no_grad():
+        for n, p in policy.model.named_parameters():
+            if "lora_B" in n:
+                p.add_(0.05 * torch.randn_like(p))
+
+
+def test_lora_over_a_full_fine_tune_directory_reloads_against_that_directory(tmp_path, gpt2_tok):
+    """A LoRA started from a saved full fine-tune must come back on those fine-tuned weights, not
+    on the hub lineage the fine-tune itself was started from."""
+    sft = tmp_path / "sft"
+    HFDecoderPolicy(tiny_llama(), gpt2_tok, origin="some/hub-base").save(str(sft), {})
+    assert json.loads((sft / "policy.json").read_text())["origin"] == "some/hub-base"
+
+    policy = load_policy(str(sft), device="cpu", lora=True)
+    assert policy.base == str(sft) and policy.origin == "some/hub-base"
+    _perturb_lora_b(policy)
+    out = tmp_path / "adapter"
+    policy.save(str(out), {"steps": 1})
+    record = json.loads((out / "policy.json").read_text())
+    assert record["base"] == str(sft)            # the weights the adapter was trained against
+    assert record["origin"] == "some/hub-base"   # the lineage, for remote-code decisions only
+    assert record["revision"] is None            # a directory has no hub commit
+
+    loaded = load_policy(str(out), device="cpu")
+    assert loaded.base == str(sft) and loaded.origin == "some/hub-base"
+    qs = _questions()
+    policy.eval()
+    loaded.eval()
+    with torch.no_grad():
+        a, _ = policy.decision_logits(qs, 512, "cpu")
+        b, _ = loaded.decision_logits(qs, 512, "cpu")
+    assert torch.allclose(a, b, atol=1e-6)
+
+
+def test_a_hub_base_records_its_commit_hash_and_reloads_at_that_revision(tmp_path, gpt2_tok, monkeypatch):
+    import rlcd.policies as policies
+    from transformers import AutoModelForCausalLM
+    sha = "0123456789abcdef0123456789abcdef01234567"
+    calls = []
+
+    def fake_from_pretrained(name, **kwargs):
+        calls.append((name, kwargs))
+        model = tiny_llama()
+        model.config._commit_hash = sha if not os.path.isdir(name) else None
+        info = {"missing_keys": [], "unexpected_keys": [], "mismatched_keys": [], "error_msgs": []}
+        return (model, info) if kwargs.get("output_loading_info") else model
+
+    monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", fake_from_pretrained)
+    monkeypatch.setattr(policies, "_load_tokenizer", lambda *a, **k: gpt2_tok)
+    policy = load_policy("fake/hub-model", device="cpu", lora=True)
+    assert (policy.base, policy.origin, policy.revision) == ("fake/hub-model", "fake/hub-model", sha)
+    assert "revision" not in calls[-1][1]  # a fresh load takes whatever main is, and records it
+    out = tmp_path / "adapter"
+    policy.save(str(out), {})
+    record = json.loads((out / "policy.json").read_text())
+    assert (record["base"], record["origin"], record["revision"]) == ("fake/hub-model", "fake/hub-model", sha)
+
+    loaded = load_policy(str(out), device="cpu")
+    assert calls[-1][0] == "fake/hub-model" and calls[-1][1]["revision"] == sha
+    assert loaded.revision == sha
 
 
 def test_hf_decoder_gradient_checkpointing_gives_the_same_gradients(tmp_path, gpt2_tok):

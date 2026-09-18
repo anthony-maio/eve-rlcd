@@ -133,13 +133,20 @@ class _HFPolicy(_PolicyBase):
     """Shared by the two Hugging Face backends: right padding with an explicit attention mask,
     left truncation that keeps the tail, and an fp32 readout at one position per row."""
 
-    def __init__(self, model, tok, letters: list[int] | None = None, base_id: str | None = None,
-                 lora: bool = False):
+    def __init__(self, model, tok, letters: list[int] | None = None, base: str | None = None,
+                 lora: bool = False, origin: str | None = None, revision: str | None = None,
+                 grad_checkpointing: bool = False):
+        """base: for a LoRA policy, the path or hub id of the weights the adapter sits on, and
+        None for a full fine-tune. origin: the hub repo the lineage started from, used only to
+        decide about remote code. revision: the hub commit of base when base is a hub id."""
         self.model = model
         self.tok = tok
         self.letters = letter_token_ids(tok) if letters is None else list(letters)
-        self.base_id = base_id
+        self.base = base
+        self.origin = origin
+        self.revision = revision
         self.lora = lora
+        self.grad_checkpointing = grad_checkpointing
         self.prepend_bos = _adds_bos(tok)
         pad = getattr(tok, "pad_token_id", None)
         self.pad_id = pad if pad is not None else getattr(tok, "eos_token_id", None)
@@ -184,14 +191,16 @@ class _HFPolicy(_PolicyBase):
 
     def save(self, out_dir: str, meta: dict) -> None:
         """Full fine-tune: the whole model. LoRA: the adapter only, with policy.json naming the
-        base it belongs to. The tokenizer goes along either way."""
+        base it belongs to (and its hub commit). The tokenizer goes along either way."""
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
         self.model.save_pretrained(out, safe_serialization=True)
         self.tok.save_pretrained(out)
         (out / "meta.json").write_text(json.dumps(meta, indent=2))
-        self._write_record(out_dir, {"backend": self.name, "lora": self.lora, "base": self.base_id,
-                                     "prepend_bos": self.prepend_bos})
+        self._write_record(out_dir, {"backend": self.name, "lora": self.lora, "base": self.base,
+                                     "origin": self.origin, "revision": self.revision,
+                                     "prepend_bos": self.prepend_bos,
+                                     "grad_checkpointing": self.grad_checkpointing})
 
 
 class HFDecoderPolicy(_HFPolicy):
@@ -236,10 +245,11 @@ class HFMaskedLMPolicy(_HFPolicy):
     """The same prompt followed by one mask token; the letters are read at the mask."""
     name = "hf-mlm"
 
-    def __init__(self, model, tok, letters=None, base_id=None, lora=False):
+    def __init__(self, model, tok, letters=None, base=None, lora=False, origin=None, revision=None,
+                 grad_checkpointing=False):
         if getattr(tok, "mask_token_id", None) is None:
             raise ValueError("the hf-mlm backend needs a tokenizer with a mask token")
-        super().__init__(model, tok, letters, base_id, lora)
+        super().__init__(model, tok, letters, base, lora, origin, revision, grad_checkpointing)
 
     def _suffix(self) -> list[int]:
         return [self.tok.mask_token_id]
@@ -332,15 +342,34 @@ def _check_rope(config) -> None:
                            f"rope_parameters.rope_theta {theta}")
 
 
+def _lineage(path_or_id: str, record: dict) -> tuple[str, str | None, str | None]:
+    """(weights, origin, revision) for a load. A saved adapter's weights are its recorded base at
+    the recorded revision; anything else loads its own weights. The origin is the hub repo the
+    lineage started from: recorded, or the id itself for a fresh hub load. Records written before
+    origin existed kept the lineage in base."""
+    if record.get("lora"):
+        return record["base"], record.get("origin", record["base"]), record.get("revision")
+    origin = record.get("origin", record.get("base"))
+    if origin is None and not os.path.isdir(path_or_id):
+        origin = path_or_id
+    return path_or_id, origin, None
+
+
 def _load_hf(policy_cls, auto_cls, path_or_id: str, device: str, lora: bool, grad_checkpointing: bool):
     record = _read_record(path_or_id)
     saved_adapter = bool(record.get("lora"))
-    base_id = record.get("base") or path_or_id
-    weights = base_id if saved_adapter else path_or_id
-    tok = _load_tokenizer(path_or_id, **remote_code_kwargs(path_or_id, base_id))
-    model = auto_cls.from_pretrained(weights, torch_dtype=torch.float32,
-                                     **remote_code_kwargs(weights, base_id))
+    weights, origin, revision = _lineage(path_or_id, record)
+    tok = _load_tokenizer(path_or_id, **remote_code_kwargs(path_or_id, origin))
+    kwargs = remote_code_kwargs(weights, origin)
+    if revision is not None:
+        if kwargs.get("revision", revision) != revision:
+            raise RuntimeError(f"{path_or_id} was trained on {weights} at {revision}, but the pinned "
+                               f"remote-code revision is {kwargs['revision']}")
+        kwargs["revision"] = revision
+    model = auto_cls.from_pretrained(weights, torch_dtype=torch.float32, **kwargs)
     _check_rope(model.config)
+    if not os.path.isdir(weights):
+        revision = getattr(model.config, "_commit_hash", None) or revision
     if grad_checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.config.use_cache = False
@@ -353,7 +382,9 @@ def _load_hf(policy_cls, auto_cls, path_or_id: str, device: str, lora: bool, gra
     if any(p.dtype != torch.float32 for p in model.parameters()):
         raise RuntimeError("master weights must stay fp32")
     model.to(device)
-    return policy_cls(model, tok, base_id=base_id, lora=saved_adapter or lora)
+    lora = saved_adapter or lora
+    return policy_cls(model, tok, base=weights if lora else None, lora=lora, origin=origin,
+                      revision=revision if lora else None, grad_checkpointing=grad_checkpointing)
 
 
 def load_policy(path_or_id: str, device: str = "cuda", backend: str = "auto", lora: bool = False,
