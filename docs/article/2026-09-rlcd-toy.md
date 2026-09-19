@@ -6,7 +6,7 @@ This is not a reproduction of Jev. I have no idea what Jev is inside, and nothin
 
 ## The one subtraction
 
-Start with the setting, because the setting is what makes this reinforcement learning and not a fancy name for a classifier. A support system routes a ticket to Billing. Later it finds out whether Billing was right. It never finds out what the other twenty-five departments would have done. That is bandit feedback: you learn the outcome of the action you took and nothing else. With full labels you would train a classifier and be done. You don't have them.
+The setting matters, because it is what makes this reinforcement learning instead of a classifier under a new name. A support system routes a ticket to Billing. Later it finds out whether Billing was right. It never finds out what the other twenty-five departments would have done. That is bandit feedback: you learn the outcome of the action you took and nothing else. With full labels you would train a classifier and be done. You don't have them.
 
 Reinforcement learning with verifiable rewards, RLVR, uses the obvious reward: sample a decision, get 1 if it was correct and 0 if not. The reward I used instead is
 
@@ -14,7 +14,7 @@ Reinforcement learning with verifiable rewards, RLVR, uses the obvious reward: s
 
 where c is that same 1 or 0 and p_a is the probability the model had put on the option it sampled. Said 90 percent and was right: reward 0.1. Said 90 percent and was wrong: reward minus 0.9. Said 30 percent and was right: reward 0.7. The reward is literally how far your stated probability sat from what happened.
 
-It is not a heuristic. A REINFORCE update with that reward is an unbiased estimate of the gradient of the Brier score, using only the outcome of the action you took, and the fixed point of the Brier score is a calibrated model. There is a numerical test of that identity in the repo because I did not trust myself; it holds to floating-point roundoff. The whole difference between the two training signals is that one subtraction. Same sampled actions, same seed, same batches, same optimizer.
+This is not a heuristic. A REINFORCE update with that reward is an unbiased estimate of the gradient of the Brier score, using only the outcome of the action you took, and the fixed point of the Brier score is a calibrated model. There is a numerical test of that identity in the repo because I did not trust myself, and it holds to floating-point roundoff. The whole difference between the two training signals is that one subtraction, with the same sampled actions, seed, batches and optimizer on both sides.
 
 ## The setup
 
@@ -40,13 +40,13 @@ Three seeds per arm, one on my 4080 and two on a Colab A100, evaluated on 8,000 
 
 RLCD gained six points of accuracy from right-or-wrong feedback alone and ended with confidence 0.83 against accuracy 0.81. Its calibration error moved by less than a hundredth on every seed. It ends about one point behind the oracle, which had the actual labels, and better calibrated than it: the oracle's second pass over the labels pushed its confidence to 0.88.
 
-RLVR at the shared settings collapsed in under 50 steps: confidence 0.99, accuracy below the warmup, stop rule. I expected that, and I expected the objection that nobody runs RLVR like that. So the fair arm runs at a fifth of the learning rate. It keeps its accuracy, gains three points over the warmup, and is still at 0.99 confidence with a calibration error of 0.21 on all three seeds, within a range of 0.007. That is not an optimizer accident. Under r = c, a perfectly calibrated policy still has a gradient pointing toward sharper. Under r = c - p_a, that gradient is zero.
+RLVR at the shared settings collapsed in under 50 steps: confidence 0.99, accuracy below the warmup, stop rule. I expected that, and I expected the objection that nobody runs RLVR like that. So the fair arm runs at a fifth of the learning rate. It keeps its accuracy, gains three points over the warmup, and is still at 0.99 confidence with a calibration error of 0.21 on all three seeds, within a range of 0.007. That is not an optimizer accident: under r = c a perfectly calibrated policy still has a gradient pointing toward sharper, and under r = c - p_a it has none.
 
 The control is the row I care about most. Keep training on the labels you already have for the same number of steps and you get accuracy 0.778 with confidence 0.97, which is the RLVR row with a different label on it. The gain in the RLCD row did not come from optimizer steps. It came from 32,000 new outcomes and a reward that does not pay you for being sure.
 
 ## Where I can check the answer
 
-Calibration error is a population statistic and it can hide a lot. So one dataset is built so that I know the true probability of every answer. Synthetic triage tickets carry cue phrases for a department. Thirty percent carry cues for two, and the generator picks the label between them with a coin flip, in shuffled order, so nothing in the text breaks the tie: the right answer there is 0.5 and 0.5, and on single-cue tickets it is 1.0. The escalate question has a 10 percent random flip in its labels, so the right confidence is 0.90.
+Calibration error is a population statistic and it can hide a lot. So I made one dataset where I know the true probability of every answer. Synthetic triage tickets carry cue phrases for a department. Thirty percent carry cues for two, and the generator picks the label between them with a coin flip, in shuffled order, so nothing in the text breaks the tie: the right answer there is 0.5 and 0.5, and on single-cue tickets it is 1.0. The escalate question has a 10 percent random flip in its labels, so the right confidence is 0.90.
 
 On fresh tickets the model never saw:
 
@@ -57,7 +57,7 @@ On fresh tickets the model never saw:
 | RLVR, low rate | 1.00 | 0.99 | 1.00 |
 | oracle | 1.00 | 0.63 | 0.88 |
 
-RLCD says 0.97 when the answer is certain and 0.59 when it is a coin flip. The RLVR model says 0.99 on the coin flips too. It has no idea it doesn't know. One caveat that I would rather say than have you find: part of RLCD's lower number on the ambiguous tickets is probability leaking to the two departments that weren't cued at all, about 8 percent of it. It got less sure, and also a bit less sharp. The oracle, with labels, splits the pair more cleanly.
+RLCD says 0.97 when the answer is certain and 0.59 when it is a coin flip. The RLVR model says 0.99 on the coin flips too. It has no idea it doesn't know. One caveat, since someone will find it anyway: about 8 percent of RLCD's probability on the ambiguous tickets leaks to the two departments that weren't cued at all. It got less sure, and also a bit less sharp. The oracle, with labels, splits the pair more cleanly.
 
 ## What this does not show
 
@@ -75,7 +75,7 @@ On my 4080, eight questions against an 800-token state take 105 milliseconds, fo
 
 Here it is on a ticket: "API latency spiked to 4 seconds; load balancer returning 502s. Note: all customers affected." Department: INFRASTRUCTURE at 0.87. Priority: P0 at 0.99, score 0.995 on the ordered scale. Page the on-call engineer: 0.89. Sixty-six milliseconds. No sentence anywhere.
 
-The exported checkpoint has the vocabulary projection removed and a 26-row decision head in its place. One honesty note: Qwen ties that projection to its input embedding, so a determined person could rebuild it. The export removes generation from the API. It does not make it physically impossible.
+The exported checkpoint has the vocabulary projection removed and a 26-row decision head in its place. One honesty note: Qwen ties that projection to its input embedding, so a determined person could rebuild it. The export removes generation from the API rather than making it physically impossible.
 
 ## So
 
