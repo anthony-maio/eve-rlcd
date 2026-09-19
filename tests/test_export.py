@@ -118,7 +118,7 @@ def test_export_records_hashes_and_refuses_tampered_weights(checkpoint, tmp_path
         assert record["sha256"][name] == hashlib.sha256((out / name).read_bytes()).hexdigest()
     load_decision_only(str(out), "cpu")
     readme = (out / "README.md").read_text()
-    assert "fix_mistral_regex" in readme and "unaffected" in readme
+    assert "fix_mistral_regex" in readme and "spurious" in readme
     # A flipped byte in the head is caught before anything runs.
     head = bytearray((out / HEAD_FILE).read_bytes())
     head[-1] ^= 1

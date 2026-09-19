@@ -134,7 +134,7 @@ def test_shared_prefix_cache_expands_views_and_leaves_the_prefix_alone(decider):
     before = [(layer.keys.clone(), layer.values.clone()) for layer in prefix.layers]
     cache = SharedPrefixCache(prefix)
     assert cache.get_seq_length() == P
-    assert cache.get_mask_sizes(torch.arange(P, P + 5), 0) == (P + 5, 0)
+    assert cache.get_mask_sizes(5, 0) == (P + 5, 0)  # (kv_length, kv_offset) for a 5-token query
     M, S = 3, 5
     layer0 = prefix.layers[0]
     new_k = torch.randn(M, layer0.keys.shape[1], S, layer0.keys.shape[3])

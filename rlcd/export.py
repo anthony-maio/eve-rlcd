@@ -67,9 +67,10 @@ records the sha256 of `model.safetensors` and `{head_file}`, and the loader veri
 
 Note: {note}
 
-Tokenizer warning: transformers 4.57 prints "The tokenizer you are loading ... with an incorrect regex
-pattern ... fix_mistral_regex" when this tokenizer loads. The warning is spurious for this tokenizer (it
-is not a Mistral tokenizer); the encodings are unaffected and are the ones the model was trained on.
+Tokenizer warning: under transformers 4.57 loading this tokenizer printed "The tokenizer you are loading
+... with an incorrect regex pattern ... fix_mistral_regex". The warning was spurious for this tokenizer (it
+is not a Mistral tokenizer) and transformers 5 no longer prints it; the encodings are the same under both
+and are the ones the model was trained on.
 """
 
 

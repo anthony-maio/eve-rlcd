@@ -5,7 +5,7 @@ description = "Toy recreation of RLCD (RL for Calibrated Decisions): a small dec
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "torch>=2.7",
-    "transformers>=4.51,<5",
+    "transformers>=5,<6",
     "datasets>=3.2",
     "safetensors>=0.5",
     "huggingface-hub>=0.30",
@@ -33,7 +33,6 @@ markers = [
     "gpu: needs a CUDA device",
 ]
 addopts = "-m 'not network and not gpu'"
-filterwarnings = ["ignore:Some non-default generation parameters:UserWarning"]
 
 [build-system]
 requires = ["hatchling"]

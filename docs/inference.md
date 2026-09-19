@@ -217,8 +217,8 @@ model in eager mode costs about 45 ms of launch overhead regardless of length (a
 an 840-token forward take the same time), and `ask` is two forwards. Above that the shared prefix pays
 for itself, up to 7.8x (fp32) or 6.6x (fast) at 64 questions.
 
-One implementation detail found by the benchmark: the sdpa attention integration of transformers 4.57
-passes `enable_gqa=True` to torch whenever there is no attention mask, and on this torch build (no
+One implementation detail found by the benchmark: the sdpa attention integration of transformers (4.57,
+and 5.x unchanged) passes `enable_gqa=True` to torch whenever there is no attention mask, and on this torch build (no
 flash attention compiled in) grouped-query attention without a mask falls back to the unfused math
 kernel, about 8x slower per layer than the fused kernel that runs when the key/value heads are
 repeated. A batch-1 prefill has no padding and so no mask, which made the prefill of a 1500-token
@@ -258,10 +258,10 @@ the note below) and a `README.md` stub. `Decider.load` recognises the directory 
 and loads it strictly: `decision.json` records the sha256 of `model.safetensors` and
 `decision_head.safetensors` and both are verified before anything runs, every tensor must match, the
 tokenizer must still give the recorded letter ids and BOS behaviour, and the loaded model must be a
-body without an output head. Loading the tokenizer prints a transformers 4.57 warning about an
-"incorrect regex pattern" and `fix_mistral_regex`; it is spurious for this tokenizer (it is not a
-Mistral tokenizer), and the encodings are unaffected and are the ones the model was trained on. The
-README stub says the same.
+body without an output head. Under transformers 4.57 loading the tokenizer printed a warning about an
+"incorrect regex pattern" and `fix_mistral_regex`; it was spurious for this tokenizer (it is not a
+Mistral tokenizer) and transformers 5 no longer prints it. The encodings are the same under both
+versions and are the ones the model was trained on. The README stub says the same.
 
 The export of `runs/q-rlcd` is 2400 MB: `model.safetensors` 2384.2 MB (the body in fp32; the
 embedding, which is also the tied head, stays because the body needs it as its input embedding),

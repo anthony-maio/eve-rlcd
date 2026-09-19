@@ -91,7 +91,7 @@ Latency on an RTX 4080 with the body in fp32 (the default), medians of 7: 8 ques
 
 ## Reproduce
 
-Environment: Python 3.12 managed by uv; `pyproject.toml` pins the PyTorch cu128 index, so `uv sync` installs a CUDA build of torch. `uv run pytest` runs the CPU tests (the `network` and `gpu` markers are excluded by default). The local runs used torch 2.11.0+cu128 and transformers 4.57.6 on one RTX 4080 (16 GB) under Windows 11.
+Environment: Python 3.12 managed by uv; `pyproject.toml` pins the PyTorch cu128 index, so `uv sync` installs a CUDA build of torch. `uv run pytest` runs the CPU tests (the `network` and `gpu` markers are excluded by default). The current environment resolves to torch 2.11.0+cu128 and transformers 5.17.0; the published runs were produced under transformers 4.57.6 on one RTX 4080 (16 GB) under Windows 11. Re-evaluating the released checkpoint under 5.17.0 reproduces its test accuracy, ECE and Brier loss within the 0.002 bf16 rounding floor stated in `docs/inference.md`, and the decision API's fp32 equivalence proof still passes.
 
 Data. `data/` is gitignored and built from the seven public datasets plus the synthetic triage generator:
 

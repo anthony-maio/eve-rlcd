@@ -41,8 +41,9 @@ class PinnedCode:
 # LiquidAI/LFM2.5-Encoder-350M, modeling_lfm2_bidirectional.py at the commit below: imports only
 # torch and transformers, touches neither the network nor the file system. It does patch the
 # transformers lfm2 module for the whole process at import time (create_causal_mask becomes a
-# padding-only mask, Lfm2ShortConv becomes a symmetric non-causal convolution). So never load it
-# in a process that also runs a causal LFM2 decoder: that decoder would silently stop being causal.
+# padding-only mask, Lfm2ShortConv.forward becomes a symmetric non-causal convolution). So never
+# load it in a process that also runs a causal LFM2 decoder: that decoder would silently stop
+# being causal.
 PINNED_REMOTE_CODE: dict[str, PinnedCode] = {
     "LiquidAI/LFM2.5-Encoder-350M": PinnedCode(
         "b886781f7c6f10ca9b7096e21b83e30a073c2f39",
@@ -67,9 +68,9 @@ def _check_lfm2_unpatched(path_or_id: str) -> None:
     if lfm2.create_causal_mask is not masking.create_causal_mask:
         raise RuntimeError(f"cannot load the LFM2 decoder {path_or_id}: "
                            "transformers.models.lfm2.modeling_lfm2.create_causal_mask has been replaced")
-    if lfm2.Lfm2ShortConv.slow_forward.__module__ != "transformers.models.lfm2.modeling_lfm2":
-        raise RuntimeError(f"cannot load the LFM2 decoder {path_or_id}: Lfm2ShortConv.slow_forward "
-                           f"comes from {lfm2.Lfm2ShortConv.slow_forward.__module__}")
+    if lfm2.Lfm2ShortConv.forward.__module__ != "transformers.models.lfm2.modeling_lfm2":
+        raise RuntimeError(f"cannot load the LFM2 decoder {path_or_id}: Lfm2ShortConv.forward "
+                           f"comes from {lfm2.Lfm2ShortConv.forward.__module__}")
 
 
 class Policy(Protocol):
@@ -364,10 +365,10 @@ class HFMaskedLMPolicy(_HFPolicy):
 
     def _readout_rows(self, questions, max_len, device) -> torch.Tensor:
         """Rows go through the body grouped by exact length, never padded. The LFM2 encoder's
-        symmetric convolution reads the token to the right of the mask, and the LFM2 layers of
-        transformers 4.x do not zero padding states (the conv layers are handed the 4D attention
-        mask, which apply_mask_to_padding_states ignores). A causal decoder never looks right,
-        so only this backend pays for it."""
+        symmetric convolution reads the token to the right of the mask, and its pinned custom
+        code (written against transformers 4.x, whose LFM2 layers handed the conv layers a 4D
+        mask that apply_mask_to_padding_states ignores) does not zero padding states. A causal
+        decoder never looks right, so only this backend pays for it."""
         ids, mask, last = self.encode(questions, max_len, "cpu")
         lengths = mask.sum(1)
         rows: list = [None] * len(questions)
@@ -435,23 +436,20 @@ def resolve_backend(path_or_id: str, backend: str = "auto") -> str:
 
 
 def _load_tokenizer(path_or_id: str, **kwargs):
-    """AutoTokenizer, falling back to PreTrainedTokenizerFast for repos saved by transformers 5,
-    whose tokenizer_config.json names a class ("TokenizersBackend") that 4.x does not have.
-    Such a repo ships a self-contained tokenizer.json, which the fast class reads as is."""
-    from transformers import AutoTokenizer, PreTrainedTokenizerFast
-    try:
-        return AutoTokenizer.from_pretrained(path_or_id, **kwargs)
-    except ValueError as e:
-        if "Tokenizer class" not in str(e):
-            raise
-        kwargs.pop("trust_remote_code", None)
-        print(f"note: {e} Falling back to PreTrainedTokenizerFast on tokenizer.json.")
-        return PreTrainedTokenizerFast.from_pretrained(path_or_id, **kwargs)
+    """The single tokenizer entry point of the HF backends. Under transformers 4.x this fell back
+    to PreTrainedTokenizerFast for repos saved by transformers 5 (whose tokenizer_config.json
+    names TokenizersBackend); transformers 5 reads those directly."""
+    from transformers import AutoTokenizer
+    return AutoTokenizer.from_pretrained(path_or_id, **kwargs)
 
 
 def _check_rope(config) -> None:
-    """A config.json written by transformers 5 keeps rope_theta inside rope_parameters, where
-    4.x does not look. Refuse to run on a silently defaulted value."""
+    """Refuse a config whose top-level rope_theta disagrees with rope_parameters.rope_theta.
+    transformers 4.x read only the former and silently defaulted it for a config.json written
+    by transformers 5; transformers 5 keeps rope_theta in rope_parameters only (a legacy
+    top-level value is folded in on load), so both attributes never coexist there and this
+    check passes trivially. It stays as the single guard against a config object that carries
+    both and disagrees."""
     theta = (getattr(config, "rope_parameters", None) or {}).get("rope_theta")
     if theta is not None and getattr(config, "rope_theta", theta) != theta:
         raise RuntimeError(f"config.rope_theta {config.rope_theta} differs from "
@@ -470,13 +468,14 @@ def _is_tied_lm_head(model, key: str) -> bool:
 def _from_pretrained_strict(auto_cls, weights: str, **kwargs):
     """from_pretrained that refuses a checkpoint whose tensors do not match the model exactly,
     where transformers would only warn and leave the gaps randomly initialized."""
-    model, info = auto_cls.from_pretrained(weights, torch_dtype=torch.float32, output_loading_info=True,
-                                           **kwargs)
-    missing = [k for k in info["missing_keys"] if not _is_tied_lm_head(model, k)]
-    mismatched = [k[0] if isinstance(k, (tuple, list)) else k for k in info.get("mismatched_keys", [])]
-    if missing or info["unexpected_keys"] or mismatched:
+    model, info = auto_cls.from_pretrained(weights, dtype=torch.float32, output_loading_info=True, **kwargs)
+    # transformers 5 reports sets (mismatched entries are (key, checkpoint shape, model shape)).
+    missing = sorted(k for k in info["missing_keys"] if not _is_tied_lm_head(model, k))
+    unexpected = sorted(info["unexpected_keys"])
+    mismatched = sorted(k[0] if isinstance(k, (tuple, list)) else k for k in info.get("mismatched_keys", []))
+    if missing or unexpected or mismatched:
         raise RuntimeError(f"{weights} does not match {type(model).__name__}: missing {missing}, "
-                           f"unexpected {info['unexpected_keys']}, mismatched {mismatched}")
+                           f"unexpected {unexpected}, mismatched {mismatched}")
     return model
 
 

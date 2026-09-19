@@ -639,8 +639,9 @@ def test_hf_mlm_reads_the_letters_at_the_mask_position(mask_tok):
 
 
 def test_hf_mlm_never_feeds_a_padded_row_to_the_body(mask_tok):
-    """A bidirectional convolution reads one token to the right of the mask, and transformers 4.x
-    does not zero LFM2 padding states, so the policy groups rows by length instead of padding."""
+    """A bidirectional convolution reads one token to the right of the mask, and the encoder's
+    custom code does not zero padding states, so the policy groups rows by length instead of
+    padding."""
     policy = HFMaskedLMPolicy(tiny_bert(len(mask_tok)), mask_tok)
     qs = _questions() + _questions()[:1]  # two rows share a length and go through together
     shapes = []
@@ -649,12 +650,16 @@ def test_hf_mlm_never_feeds_a_padded_row_to_the_body(mask_tok):
         assert kwargs["attention_mask"].all()
         assert not (kwargs["input_ids"] == policy.pad_id).any()
         shapes.append(tuple(kwargs["input_ids"].shape))
+        if kwargs["input_ids"].shape[0] == 2:  # the shared-length chunk holds the two identical rows
+            assert torch.equal(kwargs["input_ids"][0], kwargs["input_ids"][1])
 
     policy.model.bert.register_forward_pre_hook(check, with_kwargs=True)
     with torch.no_grad():
         logits, _ = policy.decision_logits(qs, max_len=512, device="cpu")
     assert len(shapes) == 3 and sorted(s[0] for s in shapes) == [1, 1, 2]
-    assert torch.equal(logits[0], logits[3])
+    # Identical rows of one CPU matmul are not bit-identical (the GEMM tiles rows differently;
+    # about 2e-7 in the body at this length), so the readout is compared at fp32 resolution.
+    assert torch.allclose(logits[0], logits[3], atol=1e-6, rtol=0)
 
 
 def test_hf_mlm_truncation_keeps_the_mask_token(mask_tok):
@@ -867,8 +872,8 @@ def test_an_lfm2_decoder_is_refused_when_the_lfm2_module_has_been_patched(lfm2_d
     with pytest.raises(RuntimeError, match="create_causal_mask"):
         load_policy(lfm2_dir, device="cpu")
     monkeypatch.undo()
-    monkeypatch.setattr(lfm2.Lfm2ShortConv, "slow_forward", other_forward)
-    with pytest.raises(RuntimeError, match="slow_forward"):
+    monkeypatch.setattr(lfm2.Lfm2ShortConv, "forward", other_forward)
+    with pytest.raises(RuntimeError, match="Lfm2ShortConv.forward"):
         load_policy(lfm2_dir, device="cpu")
 
 
@@ -897,11 +902,14 @@ def test_loading_the_pinned_encoder_sets_the_process_flag(mask_tok, monkeypatch)
 
 # ---------- repos written by transformers 5 ----------
 
-def test_tokenizer_falls_back_when_the_config_names_a_transformers_5_class(tmp_path, gpt2_tok):
+def test_tokenizer_loads_when_the_config_names_a_transformers_5_class(tmp_path, gpt2_tok):
+    """A repo saved by transformers 5 ships tokenizer.json only and may name the generic
+    TokenizersBackend class; the loader must read it and give the same encodings."""
     from rlcd.policies import _load_tokenizer
     gpt2_tok.save_pretrained(tmp_path)
-    for name in ("vocab.json", "merges.txt"):  # a transformers 5 repo ships tokenizer.json only
-        (tmp_path / name).unlink()
+    for name in ("vocab.json", "merges.txt"):
+        (tmp_path / name).unlink(missing_ok=True)
+    assert (tmp_path / "tokenizer.json").is_file()
     path = tmp_path / "tokenizer_config.json"
     config = json.loads(path.read_text())
     config["tokenizer_class"] = "TokenizersBackend"

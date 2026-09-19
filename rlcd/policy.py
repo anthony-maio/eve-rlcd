@@ -53,8 +53,12 @@ def _load_weights(model: EveMoEForCausalLM, path_or_id: str) -> None:
 def load_eve(path_or_id: str = EVE_ID, device: str = "cuda"):
     """Eve and its tokenizer from a hub id or a local checkpoint directory, fp32 on device."""
     path_or_id = os.fspath(path_or_id)
-    tokenizer = AutoTokenizer.from_pretrained(path_or_id)
-    model = EveMoEForCausalLM(load_eve_config(path_or_id))
+    config = load_eve_config(path_or_id)
+    # The config is handed over so that AutoTokenizer does not read config.json itself: eve-moe
+    # is not a registered model type, and transformers 5 warns when it falls back to the base
+    # config class for it. The tokenizer class still comes from tokenizer_config.json.
+    tokenizer = AutoTokenizer.from_pretrained(path_or_id, config=config)
+    model = EveMoEForCausalLM(config)
     if model.config.top_k != model.transformer.h[0].mlp.top_k:
         raise RuntimeError("MoE routing top_k mismatch between config and built model")
     _load_weights(model, path_or_id)

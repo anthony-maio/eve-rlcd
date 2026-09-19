@@ -113,7 +113,7 @@ class _PrefixLayer(DynamicLayer):
         self.dtype, self.device = keys.dtype, keys.device
         self.is_initialized = True
 
-    def update(self, key_states, value_states, cache_kwargs=None):
+    def update(self, key_states, value_states, *args, **kwargs):
         m = key_states.shape[0]
         keys = self.keys.to(key_states.dtype).expand(m, -1, -1, -1)
         values = self.values.to(value_states.dtype).expand(m, -1, -1, -1)
@@ -233,10 +233,10 @@ class Decider:
         adds a float mask of the query's dtype to the scores and eager attention adds it as
         well, so both implementations read it as causal (a boolean mask would be added as
         0/1 by eager, and a mask of another dtype is refused by sdpa). It is passed at all
-        because with no mask the sdpa integration of transformers 4.57 hands grouped-query
-        attention to torch with enable_gqa, which falls back to the unfused math kernel on
-        builds without flash attention (this one); with a mask it repeats the key/value heads
-        and the fused kernel runs, several times faster on a long state."""
+        because with no mask the sdpa integration of transformers (4.57 and 5.x alike) hands
+        grouped-query attention to torch with enable_gqa, which falls back to the unfused math
+        kernel on builds without flash attention (this one); with a mask it repeats the
+        key/value heads and the fused kernel runs, several times faster on a long state."""
         fast = self._fast(fast)
         ids = ([self.tok.bos_token_id] if self.policy.prepend_bos else []) + self._encode(prefix)
         ids = torch.tensor([ids], dtype=torch.long, device=self.device)
