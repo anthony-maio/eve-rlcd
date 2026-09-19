@@ -1,6 +1,6 @@
 # eve-rlcd
 
-A small decision model trained with reinforcement learning for calibrated decisions (RLCD): it answers typed questions over a shared state with a probability distribution over declared options, never with text, and the reward it was trained on pushes those probabilities toward how often the answer is right. The repository holds the training loop, the ablation against a plain outcome reward, the evaluation, and a decision-only export of the best run on Qwen3-0.6B-Base.
+A small decision model trained with reinforcement learning for calibrated decisions (RLCD): it answers typed questions over a shared state with a probability distribution over declared options, never with text, and the reward it was trained on pushes those probabilities toward how often the answer is right. The repository holds the training loop, the ablation against a plain outcome reward, the evaluation, and a decision-only export of the best run on Qwen3-0.6B-Base, published at [anthonym21/qwen3-0.6b-rlcd-decision](https://huggingface.co/anthonym21/qwen3-0.6b-rlcd-decision).
 
 The name is left over from the first attempt on my own Eve-2 model; the base changed, the name did not (see History).
 

@@ -81,4 +81,4 @@ The exported checkpoint has the vocabulary projection removed and a 26-row decis
 
 None of this tells you what Jev is. It tells you that the objective TypeSafe described is coherent, that the one-subtraction version of it does what the description says under the feedback a deployed system actually gets, and that the obvious alternative reward reliably produces a model that is sure of everything. A day and a half on a gaming card, plus some Colab credit for the extra seeds, was enough to find that out. The bigger question from the last post, whether AI gets more dependable when we stop making every component talk, is still open. The calibrated-probability half of it is not vaporware.
 
-Code and results: https://github.com/anthony-maio/eve-rlcd. The model card and the decision-only checkpoint are going up on Hugging Face under anthonym21.
+Code and results: https://github.com/anthony-maio/eve-rlcd. The decision-only checkpoint and its model card: https://huggingface.co/anthonym21/qwen3-0.6b-rlcd-decision.
