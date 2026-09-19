@@ -1,4 +1,4 @@
-"""Tweet image: stated confidence when the true answer is a coin flip.
+"""Social image: stated confidence when the true answer is a coin flip.
 
 Numbers are the dept_double.mean_max_p field of each run's eval/probe.json,
 i.e. the published checkpoint (runs/q-rlcd) and its two comparison arms.
@@ -17,16 +17,16 @@ MUTED = "#9a9992"
 IDEAL = 0.5
 
 runs = [
-    ("outcome reward\n(RLVR)", "runs/q-rlvr-lowlr", MUTED),
-    ("trained on the\nlabels", "runs/q-oracle", MUTED),
-    ("calibration reward\n(RLCD)", "runs/q-rlcd", HERO),
+    ("RLVR reward\nr = c", "runs/q-rlvr-lowlr", MUTED),
+    ("supervised on\nthe labels", "runs/q-oracle", MUTED),
+    ("RLCD reward\nr = c - p", "runs/q-rlcd", HERO),
 ]
 bars = []
 for label, run, color in runs:
     report = json.load(open(f"{run}/eval/probe.json", encoding="utf-8"))["report"]
     bars.append((label, report["dept_double"]["mean_max_p"], color, report["dept_double"]["n"]))
 
-fig, ax = plt.subplots(figsize=(8.4, 5.0), dpi=200)
+fig, ax = plt.subplots(figsize=(8.4, 5.2), dpi=200)
 fig.patch.set_facecolor(SURFACE)
 ax.set_facecolor(SURFACE)
 
@@ -51,17 +51,18 @@ for side in ("top", "right", "left"):
 ax.spines["bottom"].set_color("#d8d7d1")
 ax.tick_params(length=0)
 
-fig.text(0.035, 0.955, "When the true answer is a coin flip",
+fig.text(0.035, 0.962, "The RLCD reward, trained with actual RL",
          fontsize=19, fontweight="bold", color=INK, va="top")
-fig.text(0.035, 0.895,
-         "Dashed line is the truth. Same 0.6B model, same warmup, same training loop.",
+fig.text(0.035, 0.905,
+         "Stated confidence when the true answer is a coin flip. Dashed line is the truth.",
          fontsize=11.5, color=INK_2, va="top")
 fig.text(0.035, 0.028,
-         f"Qwen3-0.6B-Base on {bars[0][3]} held-out tickets built with a 0.5/0.5 answer.\n"
-         "The two reward arms see only whether the option they picked was right.",
+         f"Qwen3-0.6B-Base. Both reward arms share one warmup, one loop and one set of sampled "
+         f"actions; only the reward differs.\n{bars[0][3]} held-out tickets built with a 0.5/0.5 "
+         "answer.   weights: huggingface.co/anthonym21/qwen3-0.6b-rlcd-decision",
          fontsize=9.5, color=INK_2, va="bottom", linespacing=1.5)
 
-fig.subplots_adjust(left=0.10, right=0.975, top=0.845, bottom=0.215)
+fig.subplots_adjust(left=0.10, right=0.975, top=0.835, bottom=0.215)
 out = "docs/img/tweet-coinflip.png"
 fig.savefig(out, facecolor=SURFACE)
 print("wrote", out, {b[0].replace(chr(10), " "): round(b[1], 4) for b in bars})
