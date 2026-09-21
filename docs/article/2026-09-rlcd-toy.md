@@ -1,84 +1,127 @@
-# The model that won't talk, built to test the thesis
+# Training a 0.6B model to be honest about uncertainty
 
-Everyone has fixated on the wrong half of Jev. The won't-talk half is a decoding trick, and there are eight repos on the awesome-jev list doing it already. The half that matters is RLCD, the training objective that supposedly makes the probabilities mean something, and nobody had run it. So I did.
+The reward worked.
 
-Reinforcement learning for calibrated decisions turns out to fit in one subtraction. A 0.6B model trained with it says 0.60 when the true answer is a coin flip. Trained without it, same data, same loop, the model says 0.99. The weights are on Hugging Face and the rest of this post is the receipt.
+A 0.6B model learned from right-or-wrong outcomes and gained six accuracy points without losing the calibration it started with. On fresh synthetic tickets where the correct answer was a literal coin flip, its mean maximum probability was 0.593. The same training loop with an outcome-only reward said 0.990.
 
-## The problem the reward has to solve
+That 0.593 needs context. About 8.5 percent of the probability leaked to options the ticket did not support, so the model became less certain and a little less sharp. The contrast repeated across three RLCD runs and three low-rate RLVR runs. That comparison also crosses learning rates, a limitation I return to below.
 
-A deployed support system routes a ticket to Billing. Later it finds out whether Billing was right. It never finds out what the other twenty-five departments would have done. That is bandit feedback, one outcome per action taken, and it is what most systems live on after they ship. With full labels you would train a classifier and be done. The question is what you do when you don't have them.
+[TypeSafe introduced Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev) as a model that reads state and returns typed decisions with calibrated probabilities instead of generating strings. The company named its training method Reinforcement Learning for Calibrated Decisions, or RLCD, without publishing the reward or training recipe.
 
-RLVR, reinforcement learning with verifiable rewards, answers with the obvious reward, r = c: 1 if the decision was right, 0 if not. The reward I used instead is
+I wanted to test the smallest version of that idea that could fail. This independent experiment tests my own interpretation. Jev's architecture and objective remain unknown.
 
-    r = c - p_a
+## The reward
 
-where c is that same 1 or 0 and p_a is the probability the model placed on the action it took. Said 90 percent and was right: reward 0.1. Said 90 percent and was wrong: reward -0.9. Said 30 percent and was right: reward 0.7. The reward is the distance between what you said you believed and what turned out to be true.
+Start with a support system that routes a ticket to Billing. Later, the system learns whether Billing was the right call. It does not receive a label for every department it could have chosen.
 
-A REINFORCE update with that reward is an unbiased estimate of the gradient of the Brier score, under bandit feedback, and the fixed point of the Brier score is a calibrated model. There is a numerical test of that identity in the repo because I did not want to trust it on paper. It holds to floating-point roundoff. The whole difference between the two training signals is the subtraction. Same sampled actions, same seed, same batches, same optimizer.
+That is bandit feedback. The model sees the outcome of the action it took.
 
-## Setup
+The obvious reinforcement-learning reward is correctness:
 
-The model is Qwen3-0.6B-Base. The prompt is a context, a question, and up to 26 lettered options; the answer is the softmax over the 26 letter tokens at the last position. One forward pass, no generation loop. Seven public classification datasets plus a synthetic IT-triage generator, 64,000 rows.
+```text
+r = c
+```
 
-Every arm starts from the same warmup: 6,400 labeled rows, one epoch, 0.748 accuracy, calibration error 0.022. Then 32,000 rows the warmup never touched, two passes, 500 optimizer steps, and the arms differ only in what they learn from:
+`c` is 1 when the sampled action is correct and 0 when it is wrong. I used this instead:
 
-- RLCD: outcomes only, reward c - p_a.
-- RLVR: outcomes only, reward c. Run at the shared learning rate and at a fifth of it, because the shared rate destroys it.
-- Oracle: full labels on the same rows. The ceiling.
-- Control: keep training on the warmup's own labels for the same step count. It separates "more training" from "new outcomes."
+```text
+r = c - p(a)
+```
 
-Three seeds each, one on my 4080 and two on a Colab A100, evaluated on 8,000 held-out rows.
+`p(a)` is the probability the model assigned to the action before sampling it. A 90 percent prediction that turns out to be right earns 0.1. The same prediction when wrong earns -0.9. A 30 percent prediction that is right earns 0.7.
 
-## What happened
+The subtraction changes the target. Correctness alone keeps paying a calibrated policy to become sharper. Subtracting `p(a)` removes that pressure at calibration.
 
-| arm | accuracy | calibration error | mean confidence |
-|---|---|---|---|
-| warmup start | 0.748 | 0.022 | 0.76 |
-| RLCD, outcomes only | 0.808 [0.806, 0.811] | 0.023 [0.020, 0.029] | 0.83 |
-| RLVR, low learning rate | 0.778 [0.775, 0.780] | 0.213 [0.209, 0.216] | 0.99 |
-| RLVR, shared rate (stopped at step 150) | 0.576 | 0.415 | 0.99 |
-| supervised continuation, warmup labels | 0.778 | 0.192 | 0.97 |
-| oracle, full labels | 0.819 [0.817, 0.822] | 0.059 [0.046, 0.072] | 0.88 |
+The math is clean. With `p(a)` detached from the reward, the gradient of the REINFORCE loss is an unbiased estimate of half the gradient of multiclass Brier loss. The [gradient test in the repository](../../tests/test_rewards.py) enumerates every action and checks the identity against autograd to floating-point roundoff.
 
-RLCD gained six accuracy points from right-or-wrong feedback, its calibration error moved less than a hundredth on every seed, and it ends one point behind the oracle. It is also better calibrated than the oracle, whose second pass over the same labels pushed its confidence to 0.88 without a matching accuracy gain.
+This sits near prior work on proper-scoring-rule rewards, especially [Rewarding Doubt](https://arxiv.org/abs/2503.02623) by Bani-Harouni et al. That paper trains verbalized confidence with a logarithmic scoring rule. Here, the probability distribution is the policy itself and the reward uses Brier geometry.
 
-RLVR collapsed at the shared learning rate in under 50 steps. The low-rate arm is the fair comparison. It gains three accuracy points and ends at 0.99 confidence with 0.21 calibration error on all three seeds, inside a range of 0.007, which is not optimizer noise. Under r = c a perfectly calibrated model still has a gradient pushing it sharper, because confident correct answers keep earning reward. Under r = c - p_a that gradient is zero at calibration.
+## The experiment
 
-The control row is the one I would argue with hardest if I were reviewing this. Continue training on the warmup labels for the same number of steps and you get 0.778 accuracy at 0.97 confidence, which is the RLVR row under a different name. The RLCD gain did not come from more steps. It came from 32,000 new outcomes and a reward that does not pay for certainty.
+I used Qwen3-0.6B-Base. Each prompt contains a state and one question with up to 26 lettered options. The policy reads the final hidden state, slices out the 26 letter logits, masks unused letters, and applies a softmax. One decision takes one forward pass. There is no generation loop.
 
-## Checking the ground truth directly
+The training set contains 64,000 rows drawn from seven public classification datasets plus a synthetic IT-triage generator. Every RL arm begins from a 100-step supervised warmup on 6,400 labeled rows. That checkpoint scored 0.748 accuracy with 0.022 expected calibration error, or ECE.
 
-Calibration error is a population statistic and it can average over a lot of structure. So I built a dataset where I know the true probability of every answer: synthetic triage tickets where 30 percent carry cues for two departments and the generator picks between them with a coin flip. Nothing in the text resolves the ambiguity, so the right answer there is 0.5 and 0.5, and on single-cue tickets it is 1.0. The escalate label has a 10 percent random flip, so the right confidence there is 0.90.
+The RL stage uses 32,000 different rows for two epochs and 500 optimizer steps. The bandit arms only receive the outcome of each sampled action.
 
-| arm | one cue (ideal 1.0) | two cues (ideal 0.5) | escalate (ideal 0.90) |
-|---|---|---|---|
-| warmup | 0.98 | 0.80 | 0.82 |
-| RLCD | 0.97 | 0.59 | 0.93 |
-| RLVR, low rate | 1.00 | 0.99 | 1.00 |
-| oracle | 1.00 | 0.63 | 0.88 |
+- RLCD uses `c - p(a)` at a learning rate of 2e-5.
+- RLVR uses `c`. I ran it at 2e-5 and again at 4e-6 after the shared rate collapsed.
+- The oracle sees the full label on the same 32,000 rows.
+- The control keeps training on the warmup's 6,400 labels for 500 more steps.
 
-RLCD says 0.97 on the certain tickets and 0.59 on the coin flips. RLVR says 0.99 on both. It doesn't know that it doesn't know, and 0.99 is a very confident way to not know. One caveat: about 8 percent of RLCD's probability on the ambiguous tickets leaks to departments that weren't cued at all. It got less sure and a little less sharp. The oracle, working from labels, splits the pair more cleanly.
+The runs share their data order and initial checkpoint. They do not share sampled actions throughout training. This is on-policy RL, so their trajectories split as soon as the weights move.
 
-## What this doesn't show
+RLCD, low-rate RLVR, and the oracle each have three runs: one on my RTX 4080 and two on a Colab A100. The two Colab runs share one Colab warmup. Every number below comes from the same 8,000-row held-out test split at temperature 1.
 
-The best-calibrated model in the whole study is plain supervised training on 32,000 labeled rows, one pass, calibration error 0.014. If you have the labels, use them. The reward is for the case where you don't, which is most of what happens after a model ships.
+## Results
 
-The RLVR comparison runs at two learning rates because the reward-only arm cannot survive the rate the others use. No KL or entropy term was tried on the RLVR side, so the accurate scope is "this recipe miscalibrates at these settings," not "RLVR is broken." Everything is in-distribution, public data, prompts under 512 tokens, and three seeds is three seeds.
+| arm | accuracy | ECE | Brier loss | mean confidence |
+|---|---:|---:|---:|---:|
+| warmup | 0.748 | 0.022 | 0.339 | 0.763 |
+| RLCD, outcomes only | 0.808 [0.806, 0.811] | 0.023 [0.020, 0.029] | 0.267 [0.264, 0.269] | 0.830 |
+| RLVR, low learning rate | 0.778 [0.775, 0.780] | 0.213 [0.209, 0.216] | 0.432 [0.424, 0.439] | 0.991 |
+| RLVR, shared rate, stopped at step 150 | 0.576 | 0.415 | 0.835 | 0.991 |
+| supervised continuation on warmup labels | 0.778 | 0.192 | 0.407 | 0.969 |
+| oracle, full labels | 0.819 [0.817, 0.822] | 0.059 [0.046, 0.072] | 0.256 [0.253, 0.258] | 0.878 |
+| supervised, 32,000 labels | 0.817 | 0.014 | 0.251 | 0.829 |
 
-The first attempt was on my own 272M mixture-of-experts model, Eve-2. The contrast showed up there too, but Eve could not read. It never learned entailment or BoolQ even with full labels, and the same reward gave it a confidence of 0.69 whether the ticket was certain or a coin flip. A bake-off put Qwen3-0.6B at 0.817 warmup accuracy where Eve managed 0.526. That was that.
+Bracketed cells are mean [minimum, maximum] across three runs. The warmup averages two checkpoints. Single-value controls ran once.
 
-## The interface
+RLCD held calibration while it learned. It did not improve ECE, and I do not want to blur that distinction. Accuracy moved from 0.748 to 0.808. Brier loss dropped from 0.339 to 0.267.
 
-The last step was the one the previous post argued mattered: a model that does not generate text at all. You give it one state and a list of typed questions. It runs the state once, caches the key-value pairs, and evaluates every question in one batched pass against the cache. Because attention is causal, this is the same computation as asking each question alone, to within 1e-5 of the training-time path. Question order does not matter, and adding a question cannot change the answer to another one.
+The stable RLVR comparison needed one-fifth of RLCD's learning rate. It gained three accuracy points, then drove mean confidence to 0.991 and ECE to 0.213 on all three runs. At the shared 2e-5 rate, the one RLVR run collapsed inside 50 steps and hit the stop rule at step 150.
 
-On my 4080, eight questions against an 800-token state take 105 milliseconds, four times faster than one at a time. Sixty-four questions take 472 milliseconds against 3.7 seconds. Below four questions the prefill costs more than it saves.
+![Reliability diagram for the local runs](../img/reliability.png)
 
-On an actual ticket, "API latency spiked to 4 seconds; load balancer returning 502s. Note: all customers affected." Department: INFRASTRUCTURE, 0.87. Priority: P0, 0.99. Page the on-call engineer: 0.89. Sixty-six milliseconds. No sentence produced.
+The supervised controls set the scope. Five more passes over the same 6,400 labels produced an overconfident model. One pass over 32,000 labels reached 0.817 accuracy and 0.014 ECE, the best calibration in the study. If you have those labels, use them. RLCD is for the case where deployment gives you outcomes.
 
-The exported checkpoint has the vocabulary projection replaced with a 26-row decision head. Qwen ties that projection to its input embedding, so a determined person could rebuild it. The export removes generation from the API rather than making it physically impossible.
+## A probe with a known answer
 
-## So
+ECE can average away structure, so I built a test where the posterior is fixed by the data generator.
 
-None of this tells you what Jev is. It tells you that the objective TypeSafe described is coherent, that the one-subtraction version does what the description says under bandit feedback, and that the obvious alternative produces a model that is 0.99 confident about coin flips. A day and a half on a gaming card and some Colab credit was enough to find that out. Whether AI systems get more dependable when you stop making every component generate language is still open. The calibrated-probability half of that argument isn't.
+Some synthetic tickets contain one department cue, where the correct probability is 1.0. Thirty percent contain cues for two departments, and the generator chooses between them with equal probability. No text feature breaks the tie. A separate escalation label is flipped at random 10 percent of the time, setting its correct confidence to 0.90.
 
-Code and results: https://github.com/anthony-maio/eve-rlcd. Checkpoint and model card: https://huggingface.co/anthonym21/qwen3-0.6b-rlcd-decision.
+| arm | one cue, ideal 1.0 | two cues, ideal 0.5 | escalation, ideal 0.90 |
+|---|---:|---:|---:|
+| warmup | 0.984 | 0.798 | 0.821 |
+| RLCD | 0.973 | 0.593 | 0.932 |
+| RLVR, low rate | 0.999 | 0.990 | 1.000 |
+| oracle | 1.000 | 0.630 | 0.880 |
+
+![Known-posterior calibration probe](../img/probe.png)
+
+RLCD moved the ambiguous case from 0.798 toward 0.5. RLVR moved it to 0.990. The oracle reached 0.630 with labels.
+
+The leakage caveat is real. RLCD placed 0.915 total probability on the two cued departments, compared with 0.998 for the oracle. Its 0.593 maximum came from a fairer split and from probability assigned to unsupported departments. The probe supports the calibration claim, with a visible precision cost.
+
+## The decision interface
+
+The checkpoint exposes unordered choices, ordered scores, and yes/no questions. Give it one state and a question list. The runtime prefills the state once, keeps its key-value cache, then evaluates the suffixes as one batch.
+
+In fp32, the cached path matches the training-time full-prompt path at its own rounding floor. Reordering questions is bit-identical. Adding unrelated questions changed probabilities by at most 1.08e-5 in the 300-row equivalence check.
+
+On my 4080, eight questions against an 800-token state took 105.3 ms, compared with 440.9 ms one prompt at a time. Sixty-four took 472.2 ms instead of 3,679.1 ms. A single question is faster through the sequential path; by four questions the shared prefix wins in both measured precision modes.
+
+The export removes the full vocabulary projection and keeps a 26-row decision head. Qwen ties its output projection to the input embedding, so the vocabulary head can be reconstructed by someone determined to do it. The artifact removes generation from the supported API. It does not make generation physically impossible.
+
+## Limits
+
+This study is small. The runs mix seed and hardware differences. Their micro-batch shapes also differ, and two runs share a warmup. They provide mixed-condition repeatability evidence rather than three clean seed replicates.
+
+The low-rate RLVR comparison also changes two variables: reward and learning rate. RLCD at 4e-6 was never run. I did not test KL or entropy regularization for RLVR, and I did not fit post-hoc temperature. The result supports a narrow claim: this outcome-only REINFORCE recipe became overconfident at both tested rates.
+
+Everything is in-distribution. The test split comes from the same source datasets and synthetic generator as training. Prompts stop at 512 tokens. Calibration on real support tickets or new domains remains unmeasured. So do longer contexts.
+
+The detailed results were generated with an earlier row-bootstrap implementation. Those historical intervals treat correlated questions as independent and can be too narrow. The 8,000 rows contain 6,936 unique contexts. Triage contributes 1,000 questions from 334 tickets, and some BoolQ passages repeat. The evaluator now records a stable context ID and resamples whole contexts for single-run and paired intervals. The table above uses seed ranges rather than the old intervals.
+
+RLCD's validation ECE also rose mid-training before falling at the final checkpoint. The reported checkpoint was the last step. Final ECE does not describe the whole trajectory.
+
+The first version used my 272M Eve-2 mixture-of-experts model. The reward contrast appeared there, but Eve never learned MNLI or BoolQ well enough. An identical 32,000-row supervised bake-off put Eve at 0.526 accuracy and Qwen3-0.6B at 0.817. I kept the repository name and replaced the base.
+
+## What I learned
+
+One subtraction changed what the optimizer paid for. The outcome-only model drove confidence to 0.99. With `c - p(a)`, accuracy climbed while calibration held.
+
+TypeSafe's method and Jev's production claims remain outside this evidence. The experiment shows that a proper-scoring reward can learn from sparse outcomes without turning every decision into false certainty.
+
+The [code and full results](https://github.com/anthony-maio/eve-rlcd) are public. The [decision-only checkpoint and model card](https://huggingface.co/anthonym21/qwen3-0.6b-rlcd-decision) are on Hugging Face.

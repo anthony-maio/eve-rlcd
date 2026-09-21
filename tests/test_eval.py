@@ -20,7 +20,8 @@ GROUP_KEYS = {"n", "acc", "brier", "ece", "nota_rate", "nota_false_alarm", "mean
 
 
 def _pred(logits, answer, primitive="choice", source="s", nota_index=-1):
-    return {"id": "x", "source": source, "primitive": primitive, "k": len(logits),
+    return {"id": "x", "context_id": f"context-{id(logits)}", "source": source,
+            "primitive": primitive, "k": len(logits),
             "answer": answer, "logits": logits, "nota_index": nota_index}
 
 
@@ -56,6 +57,30 @@ def test_summarize_overall_has_bootstrap_intervals():
     lo, hi = o["ci"]["ece"]
     assert 0.0 <= lo < hi <= 1.0
     assert summarize(preds)["overall"]["ci"] == o["ci"]
+
+
+def test_summarize_bootstraps_contexts_instead_of_individual_questions():
+    from rlcd.metrics import bootstrap_ci
+    preds = []
+    for context in range(100):
+        correct = context >= 50
+        for question in range(10):
+            pred = _pred([5.0, 0.0], 0 if correct else 1)
+            pred["id"] = f"{context}-{question}"
+            pred["context_id"] = f"context-{context}"
+            preds.append(pred)
+    groups = np.repeat([f"context-{i}" for i in range(100)], 10)
+    correct = np.repeat(np.array([0.0] * 50 + [1.0] * 50), 10)
+    expected = bootstrap_ci(lambda x: float(x.mean()), (correct,), groups=groups)
+    assert summarize(preds)["overall"]["ci"]["acc"] == list(expected)
+
+
+def test_summarize_rejects_predictions_without_context_ids():
+    import pytest
+    pred = _pred([2.0, 0.0], 0)
+    del pred["context_id"]
+    with pytest.raises(ValueError, match="missing context_id"):
+        summarize([pred])
 
 
 def test_summarize_reports_nota_recall_and_false_alarm():
@@ -115,8 +140,10 @@ def test_predict_rows_carry_ids_logits_and_nota_index():
           Question("noul", "ctx", "is it", ["true", "false"], answer=1, source="beta", id="b-1")]
     policy = EvePolicy(model, FakeTok(), list(range(100, 126)))
     preds = predict(policy, qs, max_len=64, batch_size=1, device="cpu")
-    assert [set(p) for p in preds] == [{"id", "source", "primitive", "k", "answer", "logits", "nota_index"}] * 2
+    assert [set(p) for p in preds] == [{"id", "context_id", "source", "primitive", "k", "answer",
+                                       "logits", "nota_index"}] * 2
     assert [p["id"] for p in preds] == ["a-1", "b-1"]
+    assert preds[0]["context_id"] == preds[1]["context_id"]
     assert [len(p["logits"]) for p in preds] == [3, 2]
     assert [p["nota_index"] for p in preds] == [2, -1]
     assert [p["answer"] for p in preds] == [2, 1]
@@ -202,7 +229,8 @@ def _fake_preds(rng, n, sharpness, with_nota):
         p = np.exp(true_logits) / np.exp(true_logits).sum()
         answer = int(rng.choice(k, p=p))
         nota_index = k - 1 if (with_nota and k > 2 and i % 2 == 0) else -1
-        preds.append({"id": f"row-{i}", "source": "alpha" if i % 3 else "beta",
+        preds.append({"id": f"row-{i}", "context_id": f"context-{i // 3}",
+                      "source": "alpha" if i % 3 else "beta",
                       "primitive": "choice", "k": k, "answer": answer,
                       "logits": (true_logits * sharpness).tolist(), "nota_index": nota_index})
     return preds
@@ -406,7 +434,8 @@ def test_summarize_ece_bias_is_bootstrap_mean_minus_point_estimate():
     probs = [np.exp(np.array(p["logits"])) / np.exp(np.array(p["logits"])).sum() for p in preds]
     conf = np.array([p.max() for p in probs])
     correct = np.array([float(p.argmax() == q["answer"]) for p, q in zip(probs, preds)])
-    boot = bootstrap_stats(lambda f, c: ece(f, c, 15), (conf, correct))
+    groups = np.array([p["context_id"] for p in preds])
+    boot = bootstrap_stats(lambda f, c: ece(f, c, 15), (conf, correct), groups=groups)
     assert abs(o["ece_bias"] - (boot.mean() - o["ece"])) < 1e-9
     assert o["ece_bias"] > 0.0   # plug-in ECE of a calibrated model is biased upward under resampling
 

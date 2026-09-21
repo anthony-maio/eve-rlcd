@@ -3,6 +3,7 @@ checkpoint; comparison tables, plots, and training curves across checkpoints."""
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import random
@@ -20,7 +21,8 @@ from rlcd.schema import NOTA, Question, read_jsonl
 
 N_BINS = 15
 MIN_BIN_ROWS = 30  # reliability bins with fewer rows are too noisy to draw; they stay in the JSON
-ECE_NOTE = ("Note on ECE: plug-in ECE is biased upward, and its percentile bootstrap interval inherits that "
+ECE_NOTE = ("Note on intervals: the bootstrap resamples whole contexts, keeping questions about the same "
+            "context together. Plug-in ECE is biased upward, and its percentile interval inherits that "
             "bias, so the intervals of well calibrated runs sit high (often above the point estimate). "
             "ECE bias is the bootstrap mean minus the point estimate. For comparisons between runs use the "
             "paired differences (compare --pairs), not overlap of these intervals.")
@@ -67,7 +69,8 @@ def predict(policy, questions: list[Question], max_len: int = 512, batch_size: i
             device: str = "cuda") -> list[dict]:
     """One row per question with the first k decision logits."""
     rows = predict_logits(policy, questions, max_len, batch_size, device)
-    return [{"id": q.id, "source": q.source, "primitive": q.primitive, "k": q.k, "answer": q.answer,
+    return [{"id": q.id, "context_id": hashlib.sha256(q.context.strip().encode("utf-8")).hexdigest(),
+             "source": q.source, "primitive": q.primitive, "k": q.k, "answer": q.answer,
              "logits": row, "nota_index": q.choices.index(NOTA) if NOTA in q.choices else -1}
             for q, row in zip(questions, rows)]
 
@@ -96,6 +99,14 @@ def _ece_stat(conf: np.ndarray, correct: np.ndarray) -> float:
     return ece(conf, correct, N_BINS)
 
 
+def _context_ids(preds: list[dict]) -> np.ndarray:
+    missing = [p.get("id", f"row {i}") for i, p in enumerate(preds) if not p.get("context_id")]
+    if missing:
+        preview = ", ".join(str(x) for x in missing[:3])
+        raise ValueError(f"prediction rows are missing context_id ({preview}); rerun evaluation with this version")
+    return np.asarray([p["context_id"] for p in preds])
+
+
 def _group_metrics(preds: list[dict], temperature: float, with_ci: bool = False) -> dict:
     probs, answers, pred, conf, correct, nota_index = _arrays(preds, temperature)
     acc, mean_conf = float(correct.mean()), float(conf.mean())
@@ -104,10 +115,11 @@ def _group_metrics(preds: list[dict], temperature: float, with_ci: bool = False)
            "nota_false_alarm": nota_false_alarm(pred, answers, nota_index),
            "mean_conf": mean_conf, "conf_minus_acc": mean_conf - acc}
     if with_ci:
-        ece_boot = bootstrap_stats(_ece_stat, (conf, correct))
-        out["ci"] = {"acc": list(bootstrap_ci(_mean_stat, (correct,))),
+        groups = _context_ids(preds)
+        ece_boot = bootstrap_stats(_ece_stat, (conf, correct), groups=groups)
+        out["ci"] = {"acc": list(bootstrap_ci(_mean_stat, (correct,), groups=groups)),
                      "ece": [float(x) for x in np.percentile(ece_boot, [2.5, 97.5])],
-                     "brier": list(bootstrap_ci(_mean_stat, (_row_brier(probs, answers),)))}
+                     "brier": list(bootstrap_ci(_mean_stat, (_row_brier(probs, answers),), groups=groups))}
         out["ece_bias"] = float(ece_boot.mean() - out["ece"])
         bin_conf, bin_acc, bin_count = reliability_bins(conf, correct, N_BINS)
         out["reliability"] = {"bin_conf": bin_conf.tolist(), "bin_acc": bin_acc.tolist(),
@@ -120,13 +132,16 @@ def paired_differences(preds_a: list[dict], preds_b: list[dict]) -> dict:
     bootstrap interval. Both runs must have been evaluated on the same rows in the same order."""
     if [p["id"] for p in preds_a] != [p["id"] for p in preds_b]:
         raise ValueError("the two runs were not evaluated on the same rows in the same order")
+    groups_a, groups_b = _context_ids(preds_a), _context_ids(preds_b)
+    if not np.array_equal(groups_a, groups_b):
+        raise ValueError("the two runs do not have the same context groups in the same order")
     pa, ans_a, _, conf_a, correct_a, _ = _arrays(preds_a, 1.0)
     pb, ans_b, _, conf_b, correct_b, _ = _arrays(preds_b, 1.0)
     out = {}
     for key, fn, a, b in (("acc", _mean_stat, (correct_a,), (correct_b,)),
                           ("ece", _ece_stat, (conf_a, correct_a), (conf_b, correct_b)),
                           ("brier", _mean_stat, (_row_brier(pa, ans_a),), (_row_brier(pb, ans_b),))):
-        diff, lo, hi = paired_bootstrap_diff(fn, a, b)
+        diff, lo, hi = paired_bootstrap_diff(fn, a, b, groups=groups_a)
         out[key] = {"diff": diff, "lo": lo, "hi": hi}
     return out
 
@@ -150,7 +165,7 @@ def overall_text(m: dict) -> str:
 
 def summarize(preds: list[dict], temperature: float = 1.0) -> dict:
     """Metrics overall, by primitive, and by source. Brier is a loss: lower is better. overall
-    also carries 95 percent bootstrap intervals (1000 row resamples, seed 0) under "ci", ece_bias
+    also carries 95 percent bootstrap intervals (1000 context-group resamples, seed 0) under "ci", ece_bias
     (bootstrap mean of ECE minus the point estimate; see ECE_NOTE), and every reliability bin."""
     result = {"overall": _group_metrics(preds, temperature, with_ci=True), "by_primitive": {}, "by_source": {}}
     for key, field in (("by_primitive", "primitive"), ("by_source", "source")):
@@ -423,7 +438,7 @@ def cmd_run(args):
     summary = summarize(preds, args.temperature)
     summary["meta"] = {"model": str(args.model), "split": str(args.split), "n": len(preds),
                        "temperature": args.temperature, "max_len": args.max_len, "n_bins": N_BINS,
-                       "note": "brier is a loss, lower is better; ci is a 95 percent bootstrap interval",
+                       "note": "brier is a loss, lower is better; ci is a 95 percent context-bootstrap interval",
                        "ece_note": ECE_NOTE}
     (out / "metrics.json").write_text(to_json(summary) + "\n")
     name = args.name or Path(args.model).name
@@ -538,8 +553,9 @@ def paired_table(paired: dict[str, dict]) -> str:
         a, b = key.split(":", 1)
         lines.append(f"| {a} minus {b} | {cell(block['acc'])} | {cell(block['brier'])} | {cell(block['ece'])} |")
     lines += ["", "Each difference is the first run minus the second on the same rows. Intervals are 95 percent "
-              "percentile intervals of a paired bootstrap (1000 resamples, seed 0; every resample uses the same "
-              "rows for both runs). A difference whose interval excludes 0 is resolved by this test split."]
+              "percentile intervals of a paired context bootstrap (1000 resamples, seed 0; questions about one "
+              "context stay together, and every resample uses the same contexts for both runs). A difference "
+              "whose interval excludes 0 is resolved by this test split."]
     return "\n".join(lines) + "\n"
 
 

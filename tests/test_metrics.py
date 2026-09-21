@@ -173,6 +173,24 @@ def test_bootstrap_stats_feeds_bootstrap_ci():
     assert (float(lo), float(hi)) == bootstrap_ci(lambda a: float(a.mean()), (x,), n_boot=200, seed=3)
 
 
+def test_bootstrap_ci_resamples_whole_groups():
+    from rlcd.metrics import bootstrap_ci
+    values = np.repeat(np.array([0.0] * 50 + [1.0] * 50), 10)
+    groups = np.repeat(np.arange(100), 10)
+    mean = lambda x: float(x.mean())  # noqa: E731
+    row_lo, row_hi = bootstrap_ci(mean, (values,), n_boot=500)
+    group_lo, group_hi = bootstrap_ci(mean, (values,), n_boot=500, groups=groups)
+    assert group_hi - group_lo > 2.5 * (row_hi - row_lo)
+
+
+def test_bootstrap_ci_rejects_misaligned_groups():
+    import pytest
+
+    from rlcd.metrics import bootstrap_ci
+    with pytest.raises(ValueError, match="groups"):
+        bootstrap_ci(lambda x: float(x.mean()), (np.ones(5),), groups=np.arange(4))
+
+
 def test_paired_bootstrap_diff_is_exactly_zero_for_identical_runs():
     from rlcd.metrics import ece, paired_bootstrap_diff
     rng = np.random.default_rng(0)
@@ -181,6 +199,17 @@ def test_paired_bootstrap_diff_is_exactly_zero_for_identical_runs():
     assert paired_bootstrap_diff(lambda c: float(c.mean()), (correct,), (correct.copy(),)) == (0.0, 0.0, 0.0)
     assert paired_bootstrap_diff(lambda f, c: ece(f, c, 15), (conf, correct),
                                  (conf.copy(), correct.copy())) == (0.0, 0.0, 0.0)
+
+
+def test_paired_bootstrap_diff_resamples_whole_groups_for_both_runs():
+    from rlcd.metrics import paired_bootstrap_diff
+    groups = np.repeat(np.arange(100), 10)
+    b = np.zeros(1000)
+    a = np.repeat(np.array([0.0] * 50 + [1.0] * 50), 10)
+    mean = lambda x: float(x.mean())  # noqa: E731
+    _, row_lo, row_hi = paired_bootstrap_diff(mean, (a,), (b,), n_boot=500)
+    _, group_lo, group_hi = paired_bootstrap_diff(mean, (a,), (b,), n_boot=500, groups=groups)
+    assert group_hi - group_lo > 2.5 * (row_hi - row_lo)
 
 
 def test_paired_bootstrap_diff_sign_and_pairing():

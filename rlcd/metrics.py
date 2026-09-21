@@ -89,40 +89,62 @@ def _row_aligned(arrays: tuple) -> tuple:
     return arrays
 
 
-def bootstrap_stats(fn, arrays: tuple, n_boot: int = 1000, seed: int = 0) -> np.ndarray:
-    """fn(*arrays) on n_boot resamples of the rows, drawn with replacement. The same row indices
-    are applied to every array, so paired columns (confidence and correctness, say) stay paired."""
+def _bootstrap_groups(groups, n: int) -> tuple[np.ndarray, int] | None:
+    if groups is None:
+        return None
+    groups = np.asarray(groups)
+    if groups.ndim != 1 or len(groups) != n:
+        raise ValueError("bootstrap groups must be one-dimensional and aligned with the rows")
+    _, inverse = np.unique(groups, return_inverse=True)
+    return inverse, int(inverse.max()) + 1
+
+
+def _bootstrap_indices(n: int, rng: np.random.Generator,
+                       group_info: tuple[np.ndarray, int] | None) -> np.ndarray:
+    if group_info is None:
+        return rng.integers(0, n, n)
+    inverse, n_groups = group_info
+    multiplicity = np.bincount(rng.integers(0, n_groups, n_groups), minlength=n_groups)
+    return np.repeat(np.arange(n), multiplicity[inverse])
+
+
+def bootstrap_stats(fn, arrays: tuple, n_boot: int = 1000, seed: int = 0, groups=None) -> np.ndarray:
+    """fn(*arrays) on n_boot bootstrap resamples. Rows are sampled by default. When groups are
+    provided, whole groups are drawn with replacement so correlated rows stay together. The same
+    sampled indices are applied to every array."""
     arrays = _row_aligned(arrays)
     n = len(arrays[0])
+    group_info = _bootstrap_groups(groups, n)
     rng = np.random.default_rng(seed)
     stats = np.empty(n_boot)
     for b in range(n_boot):
-        idx = rng.integers(0, n, n)
+        idx = _bootstrap_indices(n, rng, group_info)
         stats[b] = fn(*(a[idx] for a in arrays))
     return stats
 
 
-def bootstrap_ci(fn, arrays: tuple, n_boot: int = 1000, seed: int = 0) -> tuple[float, float]:
+def bootstrap_ci(fn, arrays: tuple, n_boot: int = 1000, seed: int = 0, groups=None) -> tuple[float, float]:
     """95 percent percentile bootstrap interval of fn(*arrays)."""
-    lo, hi = np.percentile(bootstrap_stats(fn, arrays, n_boot, seed), [2.5, 97.5])
+    lo, hi = np.percentile(bootstrap_stats(fn, arrays, n_boot, seed, groups), [2.5, 97.5])
     return float(lo), float(hi)
 
 
 def paired_bootstrap_diff(stat_fn, arrays_a: tuple, arrays_b: tuple, n_boot: int = 1000,
-                          seed: int = 0) -> tuple[float, float, float]:
+                          seed: int = 0, groups=None) -> tuple[float, float, float]:
     """stat_fn(*arrays_a) minus stat_fn(*arrays_b) with a 95 percent percentile interval, for two
-    runs scored on the same rows in the same order. Every resample draws one set of row indices
-    and applies it to both runs, so the row-to-row agreement between the runs cancels out of the
-    difference instead of widening its interval. Identical runs give exactly (0, 0, 0)."""
+    runs scored on the same rows in the same order. Every resample draws one set of rows or whole
+    groups and applies it to both runs, so agreement between the runs cancels out of the difference
+    instead of widening its interval. Identical runs give exactly (0, 0, 0)."""
     both = _row_aligned(tuple(arrays_a) + tuple(arrays_b))
     a, b = both[: len(arrays_a)], both[len(arrays_a):]
     if not a or not b:
         raise ValueError("paired_bootstrap_diff needs arrays for both runs")
     n = len(a[0])
+    group_info = _bootstrap_groups(groups, n)
     rng = np.random.default_rng(seed)
     diffs = np.empty(n_boot)
     for i in range(n_boot):
-        idx = rng.integers(0, n, n)
+        idx = _bootstrap_indices(n, rng, group_info)
         diffs[i] = stat_fn(*(x[idx] for x in a)) - stat_fn(*(x[idx] for x in b))
     lo, hi = np.percentile(diffs, [2.5, 97.5])
     return float(stat_fn(*a) - stat_fn(*b)), float(lo), float(hi)
