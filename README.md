@@ -1,6 +1,6 @@
 # eve-rlcd
 
-A small decision model trained with reinforcement learning for calibrated decisions (RLCD): it answers typed questions over a shared state with a probability distribution over declared options, never with text, and the reward it was trained on pushes those probabilities toward how often the answer is right. The repository holds the training loop, the ablation against a plain outcome reward, the evaluation, and a decision-only export of the best run on Qwen3-0.6B-Base, published at [anthonym21/qwen3-0.6b-rlcd-decision](https://huggingface.co/anthonym21/qwen3-0.6b-rlcd-decision).
+A small decision model trained with reinforcement learning for calibrated decisions (RLCD): it answers typed questions over a shared state with a probability distribution over declared options, never with text, and the reward it was trained on pushes those probabilities toward how often the answer is right. The repository holds the training loop, the ablation against a plain outcome reward, the evaluation, and a decision-only export of the best run on Qwen3-0.6B-Base, published at [anthonym21/qwen3-0.6b-rlcd-decision](https://huggingface.co/anthonym21/qwen3-0.6b-rlcd-decision). The dataset is published at [anthonym21/rlcd-decision-v1](https://huggingface.co/datasets/anthonym21/rlcd-decision-v1).
 
 The name is left over from the first attempt on my own Eve-2 model; the base changed, the name did not (see History).
 
@@ -93,7 +93,7 @@ Latency on an RTX 4080 with the body in fp32 (the default), medians of 7: 8 ques
 
 Environment: Python 3.12 managed by uv; `pyproject.toml` pins the PyTorch cu128 index, so `uv sync` installs a CUDA build of torch. `uv run pytest` runs the CPU tests (the `network` and `gpu` markers are excluded by default). The current environment resolves to torch 2.11.0+cu128 and transformers 5.17.0; the published runs were produced under transformers 4.57.6 on one RTX 4080 (16 GB) under Windows 11. Re-evaluating the released checkpoint under 5.17.0 reproduces its test accuracy, ECE and Brier loss within the 0.002 bf16 rounding floor stated in `docs/inference.md`, and the decision API's fp32 equivalence proof still passes.
 
-Data. `data/` is gitignored and built from the seven public datasets plus the synthetic triage generator:
+Data. `data/` is gitignored and built from the seven public datasets plus the synthetic triage generator. The exact files used for the published runs are on the Hub as [anthonym21/rlcd-decision-v1](https://huggingface.co/datasets/anthonym21/rlcd-decision-v1) (train/val/test with md5s in the dataset card):
 
 ```
 uv run python -m rlcd.data build --out data --per-source 8000 --seed 0
